@@ -2,11 +2,14 @@
   "name": "pg-size-tracker",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+  "node": "22.x"
+  },
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js"
-  },
+  },  
   "dependencies": {
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",

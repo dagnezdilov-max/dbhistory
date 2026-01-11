@@ -1,6 +1,6 @@
-import crypto from "crypto";
 import express from "express";
 import multer from "multer";
+import crypto from "crypto";
 import { pool } from "./db";
 import { parsePgSizeOutput } from "./parser";
 
@@ -8,6 +8,57 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
 app.use(express.urlencoded({ extended: true }));
+
+// -------------------- Helpers --------------------
+
+function escapeHtml(s: string): string {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function formatBytes(bytes: number): string {
+  const abs = Math.abs(bytes);
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let u = 0;
+  let v = abs;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u++;
+  }
+  const sign = bytes < 0 ? "-" : "";
+  const num = u === 0 ? v.toFixed(0) : v.toFixed(2);
+  return `${sign}${num} ${units[u]}`;
+}
+
+// Normalize timestamps so that Map keys always match even if PG returns different string formats
+function snapKey(x: string): number {
+  return new Date(x).getTime(); // epoch ms
+}
+
+// datetime-local: interpret as UTC by appending Z
+function parseDatetimeLocalAsUTC(value?: string): Date | null {
+  const v = (value || "").trim();
+  if (!v) return null;
+  const d = new Date(v + "Z");
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+async function getLastServer(): Promise<string | null> {
+  const r = await pool.query<{ server_name: string }>(
+    `SELECT server_name
+     FROM uploads
+     WHERE server_name IS NOT NULL AND server_name <> ''
+     ORDER BY uploaded_at DESC
+     LIMIT 1`
+  );
+  return r.rows[0]?.server_name ?? null;
+}
+
 // -------------------- Auth (simple signed cookie) --------------------
 
 const COOKIE_NAME = "auth";
@@ -16,7 +67,7 @@ const AUTH_SECRET = (process.env.AUTH_SECRET || PASSWORD).trim();
 const SESSION_DAYS = 7;
 
 if (!PASSWORD) {
-  console.warn("WARNING: APP_PASSWORD is not set. Login will always fail until you set it in Render env.");
+  console.warn("WARNING: APP_PASSWORD is not set. Login will fail until you set it in Render env.");
 }
 
 function parseCookies(header?: string): Record<string, string> {
@@ -57,6 +108,9 @@ function verifyToken(token: string): boolean {
   if (parts.length !== 2) return false;
   const [payload, sig] = parts;
   const expected = sign(payload);
+
+  // timingSafeEqual needs same length
+  if (sig.length !== expected.length) return false;
   if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
 
   const obj = JSON.parse(unb64url(payload).toString("utf-8"));
@@ -65,23 +119,20 @@ function verifyToken(token: string): boolean {
 }
 
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  // allow login routes
   if (req.path === "/login" || req.path === "/logout") return next();
 
   const cookies = parseCookies(req.headers.cookie);
   const token = cookies[COOKIE_NAME];
+
   if (token && verifyToken(token)) return next();
 
-  // for API requests -> 401 JSON
   if (req.path.startsWith("/api/")) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  // for pages -> redirect login
   return res.redirect("/login");
 }
 
-// Login page
 app.get("/login", (_req, res) => {
   res.type("html").send(`
     <h2>Login</h2>
@@ -108,7 +159,9 @@ app.post("/login", async (req, res) => {
   const token = makeToken();
   res.setHeader(
     "Set-Cookie",
-    `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 24 * 60 * 60}`
+    `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${
+      SESSION_DAYS * 24 * 60 * 60
+    }`
   );
   res.redirect("/");
 });
@@ -121,65 +174,7 @@ app.get("/logout", (_req, res) => {
 // Apply auth to everything below
 app.use(requireAuth);
 
-type UploadMeta = {
-  server_name: string | null;
-  snapshot_at: Date | null;
-};
-
-function escapeHtml(s: string): string {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function formatBytes(bytes: number): string {
-  const abs = Math.abs(bytes);
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  let u = 0;
-  let v = abs;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u++;
-  }
-  const sign = bytes < 0 ? "-" : "";
-  const num = u === 0 ? v.toFixed(0) : v.toFixed(2);
-  return `${sign}${num} ${units[u]}`;
-}
-
-// datetime-local: трактуем введённое значение как UTC (добавляем Z)
-function parseDatetimeLocalAsUTC(value?: string): Date | null {
-  const v = (value || "").trim();
-  if (!v) return null;
-  const d = new Date(v + "Z");
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
-}
-
-async function getLastServer(): Promise<string | null> {
-  const r = await pool.query<{ server_name: string }>(
-    `SELECT server_name
-     FROM uploads
-     WHERE server_name IS NOT NULL AND server_name <> ''
-     ORDER BY uploaded_at DESC
-     LIMIT 1`
-  );
-  return r.rows[0]?.server_name ?? null;
-}
-
-async function resolveUploadMeta(req: express.Request): Promise<UploadMeta> {
-  const snapshot_at = parseDatetimeLocalAsUTC(String((req.body as any)?.snapshot_at || ""));
-  const providedServer = String((req.body as any)?.server_name || "").trim();
-  if (providedServer) return { server_name: providedServer, snapshot_at };
-
-  // если не указан сервер — оставляем предыдущее значение (если есть), иначе null
-  const last = await getLastServer();
-  return { server_name: last, snapshot_at };
-}
-
-// ---- Queries for UI
+// -------------------- DB helpers for UI --------------------
 
 async function getLatestSnapshot(): Promise<{ server_name: string | null; snapshot_at: string } | null> {
   const r = await pool.query<{ server_name: string | null; snapshot_at: string }>(
@@ -198,10 +193,9 @@ async function getSnapshotRows(server: string | null, snapshotAtISO: string) {
     snapshot_at: string;
     db_name: string;
     size_bytes: string;
-    size_pretty: string;
   }>(
     `
-    SELECT server_name, snapshot_at, db_name, size_bytes::text, size_pretty
+    SELECT server_name, snapshot_at, db_name, size_bytes::text
     FROM db_sizes
     WHERE server_name IS NOT DISTINCT FROM $1
       AND snapshot_at = $2
@@ -212,7 +206,7 @@ async function getSnapshotRows(server: string | null, snapshotAtISO: string) {
   return r.rows;
 }
 
-// ---- Main page
+// -------------------- Main page --------------------
 
 app.get("/", async (_req, res) => {
   const lastServer = await getLastServer();
@@ -232,6 +226,12 @@ app.get("/", async (_req, res) => {
         <b>Snapshot:</b> ${escapeHtml(new Date(latest.snapshot_at).toISOString())}
         &nbsp; | &nbsp;
         <b>Total:</b> ${escapeHtml(formatBytes(total))}
+      </p>
+
+      <p>
+        <a href="/charts">Charts</a> |
+        <a href="/diff">Diff</a> |
+        <a href="/logout">Logout</a>
       </p>
 
       <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:900px;">
@@ -262,10 +262,15 @@ app.get("/", async (_req, res) => {
           </tr>
         </tbody>
       </table>
-
-      <p style="margin-top:10px;">
-        <a href="/charts">Открыть графики</a>
+    `;
+  } else {
+    summaryHtml = `
+      <p>
+        <a href="/charts">Charts</a> |
+        <a href="/diff">Diff</a> |
+        <a href="/logout">Logout</a>
       </p>
+      <p style="color:#555">Пока нет срезов. Загрузите файл или вставьте текст ниже.</p>
     `;
   }
 
@@ -306,23 +311,24 @@ app.get("/", async (_req, res) => {
 
       <button type="submit">Upload</button>
     </form>
-
-    <hr/>
-    <p><b>API</b></p>
-    <ul>
-      <li><a href="/api/servers">/api/servers</a></li>
-      <li><a href="/api/diff">/api/diff</a> (delta last vs previous; можно ?server=...)</li>
-    </ul>
-    <p>
-    <a href="/charts">Charts</a> |
-    <a href="/diff">Diff</a> |
-    <a href="/logout">Logout</a>
-    </p>
-
   `);
 });
 
-// ---- Upload
+// -------------------- Upload --------------------
+
+type UploadMeta = {
+  server_name: string | null;
+  snapshot_at: Date | null;
+};
+
+async function resolveUploadMeta(req: express.Request): Promise<UploadMeta> {
+  const snapshot_at = parseDatetimeLocalAsUTC(String((req.body as any)?.snapshot_at || ""));
+  const providedServer = String((req.body as any)?.server_name || "").trim();
+  if (providedServer) return { server_name: providedServer, snapshot_at };
+
+  const last = await getLastServer();
+  return { server_name: last, snapshot_at };
+}
 
 app.post("/upload", upload.single("file"), async (req, res) => {
   const meta = await resolveUploadMeta(req);
@@ -342,7 +348,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     return res.status(400).send("Не удалось распарсить строки. Проверь формат текста.");
   }
 
-  // Если дата среза не указана — используем now()
   const snapshot_at = meta.snapshot_at ?? new Date();
 
   const client = await pool.connect();
@@ -381,7 +386,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     );
 
     await client.query("COMMIT");
-
     res.redirect("/");
   } catch (e: any) {
     await client.query("ROLLBACK");
@@ -392,7 +396,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// ---- API
+// -------------------- API --------------------
 
 app.get("/api/servers", async (_req, res) => {
   const r = await pool.query<{ server_name: string }>(
@@ -404,7 +408,6 @@ app.get("/api/servers", async (_req, res) => {
   res.json(r.rows.map((x) => x.server_name));
 });
 
-// snapshots list per server (for bar chart dropdown)
 app.get("/api/snapshots", async (req, res) => {
   const server = String(req.query.server || "").trim();
   if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
@@ -419,7 +422,6 @@ app.get("/api/snapshots", async (req, res) => {
   res.json(r.rows.map((x) => x.snapshot_at));
 });
 
-// rows for a given snapshot (bar chart)
 app.get("/api/snapshot", async (req, res) => {
   const server = String(req.query.server || "").trim();
   const snapshot_at = String(req.query.snapshot_at || "").trim();
@@ -438,7 +440,6 @@ app.get("/api/snapshot", async (req, res) => {
   res.json(r.rows);
 });
 
-// rows for line chart: all dbs across time for a server
 app.get("/api/lines", async (req, res) => {
   const server = String(req.query.server || "").trim();
   if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
@@ -455,11 +456,7 @@ app.get("/api/lines", async (req, res) => {
   res.json(r.rows);
 });
 
-// diff endpoint (как раньше, но оставим)
 app.get("/api/diff", async (req, res) => {
-  function snapKey(x: string): number {
-  return new Date(x).getTime(); // epoch ms
-  }
   const server = String(req.query.server || "").trim();
 
   const q = server
@@ -525,7 +522,7 @@ app.get("/api/diff", async (req, res) => {
   res.json(r.rows);
 });
 
-// ---- Charts page (2 charts + back button)
+// -------------------- Charts page (2 charts + back button) --------------------
 
 app.get("/charts", async (_req, res) => {
   res.type("html").send(`
@@ -539,6 +536,7 @@ app.get("/charts", async (_req, res) => {
 <body>
   <div style="margin-bottom:12px;">
     <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
+    <a href="/logout" style="margin-left:10px;">Logout</a>
   </div>
 
   <h2>DB Size Charts</h2>
@@ -602,7 +600,6 @@ async function loadSnapshots(server) {
 }
 
 function buildLineDatasets(rows) {
-  // rows: [{db_name, snapshot_at, size_bytes}]
   const snapshots = [...new Set(rows.map(r => r.snapshot_at))].sort();
   const dbs = [...new Set(rows.map(r => r.db_name))].sort();
 
@@ -629,14 +626,14 @@ async function loadLines() {
   if (!server) return;
 
   const rows = await fetchJson('/api/lines?server=' + encodeURIComponent(server));
-  const { labels, datasets } = buildLineDatasets(rows);
+  const built = buildLineDatasets(rows);
 
   const ctx = document.getElementById('lineChart');
   if (lineChart) lineChart.destroy();
 
   lineChart = new Chart(ctx, {
     type: 'line',
-    data: { labels, datasets },
+    data: { labels: built.labels, datasets: built.datasets },
     options: {
       responsive: false,
       plugins: { legend: { display: true } },
@@ -706,6 +703,8 @@ document.getElementById('serverSelect').addEventListener('change', async (e) => 
   `);
 });
 
+// -------------------- Diff page (10 snapshots + % + monthly growth) --------------------
+
 app.get("/diff", async (req, res) => {
   const serversR = await pool.query<{ server_name: string }>(
     `SELECT DISTINCT server_name
@@ -732,11 +731,9 @@ app.get("/diff", async (req, res) => {
     [server]
   );
 
-  // snapshots DESC from DB; we want oldest -> newest for table readability
   const snapshotsDesc = snapsR.rows.map((x) => x.snapshot_at);
-  const snapshots = [...snapshotsDesc].reverse();
+  const snapshots = [...snapshotsDesc].reverse(); // oldest -> newest
   const snapshotKeys = snapshots.map(snapKey);
-
 
   if (snapshots.length === 0) {
     return res.type("html").send(`
@@ -754,22 +751,20 @@ app.get("/diff", async (req, res) => {
     [server, snapshots]
   );
 
-  // Build maps: db -> snapshot -> bytes
-  const byDb = new Map<string, Map<string, number>>();
+  // db -> (snapKey -> bytes)
+  const byDb = new Map<string, Map<number, number>>();
   for (const r of dataR.rows) {
     if (!byDb.has(r.db_name)) byDb.set(r.db_name, new Map<number, number>());
     byDb.get(r.db_name)!.set(snapKey(r.snapshot_at), Number(r.size_bytes));
   }
 
-
   const dbNames = [...byDb.keys()].sort();
 
-  // % change and monthly growth based on last two snapshots
-  const last = snapshots[snapshots.length - 1];
-  const prev = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
+  const lastSnap = snapshots[snapshots.length - 1];
+  const prevSnap = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
 
   const daysDiff =
-    prev ? (new Date(last).getTime() - new Date(prev).getTime()) / (1000 * 60 * 60 * 24) : null;
+    prevSnap ? (new Date(lastSnap).getTime() - new Date(prevSnap).getTime()) / (1000 * 60 * 60 * 24) : null;
 
   function pctChange(cur: number | null, prevv: number | null): string {
     if (cur === null || prevv === null || prevv === 0) return "";
@@ -780,7 +775,7 @@ app.get("/diff", async (req, res) => {
   function monthlyGrowth(cur: number | null, prevv: number | null): string {
     if (cur === null || prevv === null || !daysDiff || daysDiff <= 0) return "";
     const delta = cur - prevv;
-    const perMonth = (delta / daysDiff) * 30; // ~30 дней
+    const perMonth = (delta / daysDiff) * 30; // approximate 30-day month
     return formatBytes(perMonth);
   }
 
@@ -792,19 +787,22 @@ app.get("/diff", async (req, res) => {
     .map((s) => `<th align="right">${escapeHtml(new Date(s).toISOString().slice(0, 10))}</th>`)
     .join("");
 
+  const lastKey = snapshotKeys[snapshotKeys.length - 1];
+  const prevKey = snapshotKeys.length >= 2 ? snapshotKeys[snapshotKeys.length - 2] : null;
+
   const rowsHtml = dbNames
     .map((db) => {
       const m = byDb.get(db)!;
+
       const values = snapshotKeys.map((k) => (m.has(k) ? m.get(k)! : null));
-      const cur = values[values.length - 1];
-      const prv = prev ? (m.has(prev) ? m.get(prev)! : null) : null;
+
+      const cur = m.has(lastKey) ? m.get(lastKey)! : null;
+      const prv = prevKey !== null && m.has(prevKey) ? m.get(prevKey)! : null;
 
       return `
         <tr>
           <td>${escapeHtml(db)}</td>
-          ${values
-            .map((v) => `<td align="right">${v === null ? "" : escapeHtml(formatBytes(v))}</td>`)
-            .join("")}
+          ${values.map((v) => `<td align="right">${v === null ? "" : escapeHtml(formatBytes(v))}</td>`).join("")}
           <td align="right">${escapeHtml(pctChange(cur, prv))}</td>
           <td align="right">${escapeHtml(monthlyGrowth(cur, prv))}</td>
         </tr>
@@ -846,7 +844,7 @@ app.get("/diff", async (req, res) => {
   `);
 });
 
-
+// -------------------- Listen --------------------
 
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {

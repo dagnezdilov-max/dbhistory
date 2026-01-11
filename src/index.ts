@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import express from "express";
 import multer from "multer";
 import { pool } from "./db";
@@ -7,6 +8,118 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
 app.use(express.urlencoded({ extended: true }));
+// -------------------- Auth (simple signed cookie) --------------------
+
+const COOKIE_NAME = "auth";
+const PASSWORD = (process.env.APP_PASSWORD || "").trim();
+const AUTH_SECRET = (process.env.AUTH_SECRET || PASSWORD).trim();
+const SESSION_DAYS = 7;
+
+if (!PASSWORD) {
+  console.warn("WARNING: APP_PASSWORD is not set. Login will always fail until you set it in Render env.");
+}
+
+function parseCookies(header?: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const h = header || "";
+  for (const part of h.split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (!k) continue;
+    out[k] = decodeURIComponent(rest.join("=") || "");
+  }
+  return out;
+}
+
+function b64url(input: Buffer | string): string {
+  const b = Buffer.isBuffer(input) ? input : Buffer.from(input, "utf-8");
+  return b.toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function unb64url(s: string): Buffer {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const x = (s + pad).replaceAll("-", "+").replaceAll("_", "/");
+  return Buffer.from(x, "base64");
+}
+
+function sign(dataB64: string): string {
+  return b64url(crypto.createHmac("sha256", AUTH_SECRET).update(dataB64).digest());
+}
+
+function makeToken(): string {
+  const exp = Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000;
+  const payload = b64url(JSON.stringify({ exp }));
+  const sig = sign(payload);
+  return `${payload}.${sig}`;
+}
+
+function verifyToken(token: string): boolean {
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [payload, sig] = parts;
+  const expected = sign(payload);
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
+
+  const obj = JSON.parse(unb64url(payload).toString("utf-8"));
+  if (!obj?.exp || typeof obj.exp !== "number") return false;
+  return Date.now() < obj.exp;
+}
+
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  // allow login routes
+  if (req.path === "/login" || req.path === "/logout") return next();
+
+  const cookies = parseCookies(req.headers.cookie);
+  const token = cookies[COOKIE_NAME];
+  if (token && verifyToken(token)) return next();
+
+  // for API requests -> 401 JSON
+  if (req.path.startsWith("/api/")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // for pages -> redirect login
+  return res.redirect("/login");
+}
+
+// Login page
+app.get("/login", (_req, res) => {
+  res.type("html").send(`
+    <h2>Login</h2>
+    <form method="post" action="/login">
+      <div style="margin-bottom:8px;">
+        <label>Password:</label>
+        <input type="password" name="password" style="width:260px;" autofocus />
+      </div>
+      <button type="submit">Sign in</button>
+    </form>
+  `);
+});
+
+app.post("/login", async (req, res) => {
+  const pw = String((req.body as any)?.password || "");
+  if (!PASSWORD || pw !== PASSWORD) {
+    return res.status(401).type("html").send(`
+      <h2>Login</h2>
+      <p style="color:red;">Wrong password</p>
+      <a href="/login">Try again</a>
+    `);
+  }
+
+  const token = makeToken();
+  res.setHeader(
+    "Set-Cookie",
+    `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 24 * 60 * 60}`
+  );
+  res.redirect("/");
+});
+
+app.get("/logout", (_req, res) => {
+  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`);
+  res.redirect("/login");
+});
+
+// Apply auth to everything below
+app.use(requireAuth);
 
 type UploadMeta = {
   server_name: string | null;
@@ -200,6 +313,12 @@ app.get("/", async (_req, res) => {
       <li><a href="/api/servers">/api/servers</a></li>
       <li><a href="/api/diff">/api/diff</a> (delta last vs previous; можно ?server=...)</li>
     </ul>
+    <p>
+    <a href="/charts">Charts</a> |
+    <a href="/diff">Diff</a> |
+    <a href="/logout">Logout</a>
+    </p>
+
   `);
 });
 
@@ -583,6 +702,145 @@ document.getElementById('serverSelect').addEventListener('change', async (e) => 
 </html>
   `);
 });
+
+app.get("/diff", async (req, res) => {
+  const serversR = await pool.query<{ server_name: string }>(
+    `SELECT DISTINCT server_name
+     FROM uploads
+     WHERE server_name IS NOT NULL AND server_name <> ''
+     ORDER BY server_name`
+  );
+  const servers = serversR.rows.map((x) => x.server_name);
+
+  const server = String(req.query.server || servers[0] || "").trim();
+  if (!server) {
+    return res.type("html").send(`
+      <p>No servers yet.</p>
+      <p><a href="/">Back</a></p>
+    `);
+  }
+
+  const snapsR = await pool.query<{ snapshot_at: string }>(
+    `SELECT DISTINCT snapshot_at
+     FROM uploads
+     WHERE server_name = $1 AND snapshot_at IS NOT NULL
+     ORDER BY snapshot_at DESC
+     LIMIT 10`,
+    [server]
+  );
+
+  // snapshots DESC from DB; we want oldest -> newest for table readability
+  const snapshotsDesc = snapsR.rows.map((x) => x.snapshot_at);
+  const snapshots = [...snapshotsDesc].reverse();
+
+  if (snapshots.length === 0) {
+    return res.type("html").send(`
+      <p>No snapshots for server ${escapeHtml(server)}.</p>
+      <p><a href="/">Back</a></p>
+    `);
+  }
+
+  const dataR = await pool.query<{ db_name: string; snapshot_at: string; size_bytes: string }>(
+    `
+    SELECT db_name, snapshot_at, size_bytes::text
+    FROM db_sizes
+    WHERE server_name = $1 AND snapshot_at = ANY($2)
+    `,
+    [server, snapshots]
+  );
+
+  // Build maps: db -> snapshot -> bytes
+  const byDb = new Map<string, Map<string, number>>();
+  for (const r of dataR.rows) {
+    if (!byDb.has(r.db_name)) byDb.set(r.db_name, new Map());
+    byDb.get(r.db_name)!.set(r.snapshot_at, Number(r.size_bytes));
+  }
+
+  const dbNames = [...byDb.keys()].sort();
+
+  // % change and monthly growth based on last two snapshots
+  const last = snapshots[snapshots.length - 1];
+  const prev = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
+
+  const daysDiff =
+    prev ? (new Date(last).getTime() - new Date(prev).getTime()) / (1000 * 60 * 60 * 24) : null;
+
+  function pctChange(cur: number | null, prevv: number | null): string {
+    if (cur === null || prevv === null || prevv === 0) return "";
+    const pct = ((cur - prevv) / prevv) * 100;
+    return pct.toFixed(2) + "%";
+  }
+
+  function monthlyGrowth(cur: number | null, prevv: number | null): string {
+    if (cur === null || prevv === null || !daysDiff || daysDiff <= 0) return "";
+    const delta = cur - prevv;
+    const perMonth = (delta / daysDiff) * 30; // ~30 дней
+    return formatBytes(perMonth);
+  }
+
+  const serverOptions = servers
+    .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s)}</option>`)
+    .join("");
+
+  const headerSnapshots = snapshots
+    .map((s) => `<th align="right">${escapeHtml(new Date(s).toISOString().slice(0, 10))}</th>`)
+    .join("");
+
+  const rowsHtml = dbNames
+    .map((db) => {
+      const m = byDb.get(db)!;
+      const values = snapshots.map((s) => (m.has(s) ? m.get(s)! : null));
+      const cur = values[values.length - 1];
+      const prv = prev ? (m.has(prev) ? m.get(prev)! : null) : null;
+
+      return `
+        <tr>
+          <td>${escapeHtml(db)}</td>
+          ${values
+            .map((v) => `<td align="right">${v === null ? "" : escapeHtml(formatBytes(v))}</td>`)
+            .join("")}
+          <td align="right">${escapeHtml(pctChange(cur, prv))}</td>
+          <td align="right">${escapeHtml(monthlyGrowth(cur, prv))}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  res.type("html").send(`
+    <div style="margin-bottom:12px;">
+      <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
+      <a href="/logout" style="margin-left:10px;">Logout</a>
+    </div>
+
+    <h2>Diff (last 10 snapshots)</h2>
+
+    <form method="get" action="/diff" style="margin-bottom:12px;">
+      <label>Server: </label>
+      <select name="server">${serverOptions}</select>
+      <button type="submit" style="margin-left:10px;">Load</button>
+    </form>
+
+    <p style="color:#555">
+      Columns: 10 snapshots (oldest → newest), then % change (last vs prev), then monthly growth estimate.
+    </p>
+
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:1100px;">
+      <thead>
+        <tr style="background:#f2f2f2;">
+          <th align="left">Database</th>
+          ${headerSnapshots}
+          <th align="right">% (last vs prev)</th>
+          <th align="right">Monthly growth</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml}
+      </tbody>
+    </table>
+  `);
+});
+
+
 
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, () => {

@@ -585,4 +585,6 @@ document.getElementById('serverSelect').addEventListener('change', async (e) => 
 });
 
 const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => console.log(\`Listening on \${PORT}\`));
+app.listen(PORT, () => {
+  console.log("Listening on " + PORT);
+});

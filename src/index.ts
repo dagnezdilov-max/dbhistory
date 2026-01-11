@@ -457,6 +457,9 @@ app.get("/api/lines", async (req, res) => {
 
 // diff endpoint (как раньше, но оставим)
 app.get("/api/diff", async (req, res) => {
+  function snapKey(x: string): number {
+  return new Date(x).getTime(); // epoch ms
+  }
   const server = String(req.query.server || "").trim();
 
   const q = server
@@ -732,6 +735,8 @@ app.get("/diff", async (req, res) => {
   // snapshots DESC from DB; we want oldest -> newest for table readability
   const snapshotsDesc = snapsR.rows.map((x) => x.snapshot_at);
   const snapshots = [...snapshotsDesc].reverse();
+  const snapshotKeys = snapshots.map(snapKey);
+
 
   if (snapshots.length === 0) {
     return res.type("html").send(`
@@ -752,9 +757,10 @@ app.get("/diff", async (req, res) => {
   // Build maps: db -> snapshot -> bytes
   const byDb = new Map<string, Map<string, number>>();
   for (const r of dataR.rows) {
-    if (!byDb.has(r.db_name)) byDb.set(r.db_name, new Map());
-    byDb.get(r.db_name)!.set(r.snapshot_at, Number(r.size_bytes));
+    if (!byDb.has(r.db_name)) byDb.set(r.db_name, new Map<number, number>());
+    byDb.get(r.db_name)!.set(snapKey(r.snapshot_at), Number(r.size_bytes));
   }
+
 
   const dbNames = [...byDb.keys()].sort();
 
@@ -789,7 +795,7 @@ app.get("/diff", async (req, res) => {
   const rowsHtml = dbNames
     .map((db) => {
       const m = byDb.get(db)!;
-      const values = snapshots.map((s) => (m.has(s) ? m.get(s)! : null));
+      const values = snapshotKeys.map((k) => (m.has(k) ? m.get(k)! : null));
       const cur = values[values.length - 1];
       const prv = prev ? (m.has(prev) ? m.get(prev)! : null) : null;
 

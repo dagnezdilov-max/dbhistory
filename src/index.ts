@@ -1027,7 +1027,7 @@ app.get("/snapshots", async (req, res) => {
           <td>
             <form method="post" action="/snapshots/delete" onsubmit="return confirm('Delete snapshot ${escapeHtml(snapIso)} for server ${escapeHtml(server)}?');">
               <input type="hidden" name="server_name" value="${escapeHtml(server)}" />
-              <input type="hidden" name="snapshot_at" value="${escapeHtml(r.snapshot_at)}" />
+              <input type="hidden" name="snapshot_at" value="${escapeHtml(snapIso)}" />
               <button type="submit">Delete</button>
             </form>
           </td>
@@ -1072,7 +1072,15 @@ app.get("/snapshots", async (req, res) => {
 
 app.post("/snapshots/delete", async (req, res) => {
   const server = String((req.body as any)?.server_name || "").trim();
-  const snapshot_at = String((req.body as any)?.snapshot_at || "").trim();
+  const snapshot_at_raw = String((req.body as any)?.snapshot_at || "").trim();
+  const snapshot_date = snapshot_at_raw ? new Date(snapshot_at_raw) : null;
+  if (!snapshot_date || Number.isNaN(snapshot_date.getTime())) {
+    return res.status(400).type("html").send(`
+      <p>Invalid snapshot_at</p>
+      <p><a href="/snapshots">Back</a></p>
+    `);
+  }
+  const snapshot_at = snapshot_date.toISOString();
 
   if (!server || !snapshot_at) {
     return res.status(400).type("html").send(`

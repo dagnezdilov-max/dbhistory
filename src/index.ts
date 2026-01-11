@@ -119,7 +119,7 @@ function verifyToken(token: string): boolean {
 }
 
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (req.path === "/login" || req.path === "/logout") return next();
+  if (req.path === "/login" || req.path === "/logout" || req.path === "/api/ingest") return next();
 
   const cookies = parseCookies(req.headers.cookie);
   const token = cookies[COOKIE_NAME];
@@ -174,6 +174,99 @@ app.get("/logout", (_req, res) => {
 // Apply auth to everything below
 app.use(requireAuth);
 
+// -------------------- Ingest API (for automation) --------------------
+// Accepts plain text (psql output) and stores it as a snapshot.
+// Auth: X-API-Key header must match INGEST_API_KEY environment variable.
+// Usage example:
+//   POST /api/ingest?server_name=prod-1&snapshot_at=2026-01-11T00:00:00Z
+//   Header: X-API-Key: <key>
+//   Body: lines like "dbname | 37 MB"
+
+const INGEST_API_KEY = String(process.env.INGEST_API_KEY || "").trim();
+
+// Accept any text body. (Must be registered before the route)
+app.use(express.text({ type: "*/*", limit: "10mb" }));
+
+app.post("/api/ingest", async (req, res) => {
+  const apiKey = String(req.header("x-api-key") || "");
+  if (!INGEST_API_KEY || apiKey !== INGEST_API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const server_name = String(req.query.server_name || "").trim() || null;
+
+  // snapshot_at can be ISO (recommended). If not provided, use now().
+  const snapshotRaw = String(req.query.snapshot_at || "").trim();
+  const snapshot_at = snapshotRaw ? new Date(snapshotRaw) : new Date();
+  if (Number.isNaN(snapshot_at.getTime())) {
+    return res.status(400).json({ error: "Invalid snapshot_at. Use ISO like 2026-01-11T00:00:00Z" });
+  }
+
+  const content = typeof req.body === "string" ? req.body : "";
+  if (!content.trim()) {
+    return res.status(400).json({ error: "Empty body" });
+  }
+
+  const parsed = parsePgSizeOutput(content);
+  if (parsed.length === 0) {
+    return res.status(400).json({ error: "Parse failed" });
+  }
+
+  const originalName = "api-ingest";
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const up = await client.query<{ id: string }>(
+      `INSERT INTO uploads (original_name, content, snapshot_at, server_name)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [originalName, content, snapshot_at.toISOString(), server_name]
+    );
+    const uploadId = up.rows[0].id;
+
+    const values: Array<string | number | null> = [];
+    const placeholders: string[] = [];
+    let i = 1;
+
+    for (const r of parsed) {
+      placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
+      values.push(
+        uploadId,
+        snapshot_at.toISOString(),
+        snapshot_at.toISOString(),
+        server_name,
+        r.db_name,
+        r.size_bytes,
+        r.size_pretty
+      );
+    }
+
+    await client.query(
+      `INSERT INTO db_sizes (upload_id, captured_at, snapshot_at, server_name, db_name, size_bytes, size_pretty)
+       VALUES ${placeholders.join(", ")}`,
+      values
+    );
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      rows: parsed.length,
+      server_name,
+      snapshot_at: snapshot_at.toISOString(),
+    });
+  } catch (e: any) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    return res.status(500).json({ error: e?.message || "failed" });
+  } finally {
+    client.release();
+  }
+});
+
+
 // -------------------- DB helpers for UI --------------------
 
 async function getLatestSnapshot(): Promise<{ server_name: string | null; snapshot_at: string } | null> {
@@ -192,14 +285,14 @@ async function getSnapshotRows(server: string | null, snapshotAtISO: string) {
     server_name: string | null;
     snapshot_at: string;
     db_name: string;
-    size_bytes: string; // pg returns bigint as string
+    size_bytes: string;
   }>(
     `
-    SELECT server_name, snapshot_at, db_name, size_bytes
+    SELECT server_name, snapshot_at, db_name, size_bytes::text
     FROM db_sizes
     WHERE server_name IS NOT DISTINCT FROM $1
       AND snapshot_at = $2
-    ORDER BY size_bytes::bigint DESC, db_name ASC
+    ORDER BY size_bytes DESC, db_name ASC
     `,
     [server, snapshotAtISO]
   );
@@ -216,8 +309,6 @@ app.get("/", async (_req, res) => {
 
   if (latest) {
     const rows = await getSnapshotRows(latest.server_name, latest.snapshot_at);
-    // Extra safety: ensure sorting by size desc (sometimes DB order can be lost if data types differ)
-    rows.sort((a, b) => Number(b.size_bytes) - Number(a.size_bytes) || a.db_name.localeCompare(b.db_name));
     const total = rows.reduce((sum, r) => sum + Number(r.size_bytes), 0);
 
     summaryHtml = `
@@ -233,6 +324,7 @@ app.get("/", async (_req, res) => {
       <p>
         <a href="/charts">Charts</a> |
         <a href="/diff">Diff</a> |
+        <a href="/snapshots">Snapshots</a> |
         <a href="/logout">Logout</a>
       </p>
 
@@ -270,6 +362,7 @@ app.get("/", async (_req, res) => {
       <p>
         <a href="/charts">Charts</a> |
         <a href="/diff">Diff</a> |
+        <a href="/snapshots">Snapshots</a> |
         <a href="/logout">Logout</a>
       </p>
       <p style="color:#555">Пока нет срезов. Загрузите файл или вставьте текст ниже.</p>
@@ -876,6 +969,147 @@ app.get("/diff", async (req, res) => {
       </tbody>
     </table>
   `);
+});
+
+
+// -------------------- Snapshots manager (delete snapshots) --------------------
+
+app.get("/snapshots", async (req, res) => {
+  const serversR = await pool.query<{ server_name: string }>(
+    `SELECT DISTINCT server_name
+     FROM uploads
+     WHERE server_name IS NOT NULL AND server_name <> ''
+     ORDER BY server_name`
+  );
+  const servers = serversR.rows.map((x) => x.server_name);
+
+  const server = String(req.query.server || servers[0] || "").trim();
+  if (!server) {
+    return res.type("html").send(`
+      <div style="margin-bottom:12px;">
+        <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
+        <a href="/logout" style="margin-left:10px;">Logout</a>
+      </div>
+      <p>No servers yet.</p>
+    `);
+  }
+
+  const snapsR = await pool.query<{ snapshot_at: string; uploads_count: string; total_bytes: string }>(
+    `
+    SELECT
+      u.snapshot_at,
+      COUNT(*)::text AS uploads_count,
+      COALESCE(SUM(d.size_bytes), 0)::text AS total_bytes
+    FROM uploads u
+    LEFT JOIN db_sizes d
+      ON d.upload_id = u.id
+    WHERE u.server_name = $1 AND u.snapshot_at IS NOT NULL
+    GROUP BY u.snapshot_at
+    ORDER BY u.snapshot_at DESC
+    LIMIT 60
+    `,
+    [server]
+  );
+
+  const serverOptions = servers
+    .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s)}</option>`)
+    .join("");
+
+  const rowsHtml = snapsR.rows
+    .map((r) => {
+      const snapIso = new Date(r.snapshot_at).toISOString();
+      const total = formatBytes(Number(r.total_bytes));
+      return `
+        <tr>
+          <td>${escapeHtml(snapIso)}</td>
+          <td align="right">${escapeHtml(r.uploads_count)}</td>
+          <td align="right">${escapeHtml(total)}</td>
+          <td>
+            <form method="post" action="/snapshots/delete" onsubmit="return confirm('Delete snapshot ${escapeHtml(snapIso)} for server ${escapeHtml(server)}?');">
+              <input type="hidden" name="server_name" value="${escapeHtml(server)}" />
+              <input type="hidden" name="snapshot_at" value="${escapeHtml(r.snapshot_at)}" />
+              <button type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  res.type("html").send(`
+    <div style="margin-bottom:12px;">
+      <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
+      <a href="/logout" style="margin-left:10px;">Logout</a>
+    </div>
+
+    <h2>Snapshots</h2>
+
+    <form method="get" action="/snapshots" style="margin-bottom:12px;">
+      <label>Server: </label>
+      <select name="server">${serverOptions}</select>
+      <button type="submit" style="margin-left:10px;">Load</button>
+    </form>
+
+    <p style="color:#555">
+      This page deletes snapshots by (server_name + snapshot_at). It deletes all uploads matching that snapshot and cascades to db_sizes.
+    </p>
+
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:900px;">
+      <thead>
+        <tr style="background:#f2f2f2;">
+          <th align="left">Snapshot (UTC)</th>
+          <th align="right">Uploads</th>
+          <th align="right">Total size</th>
+          <th align="left">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml || '<tr><td colspan="4" style="color:#555">No snapshots found</td></tr>'}
+      </tbody>
+    </table>
+  `);
+});
+
+app.post("/snapshots/delete", async (req, res) => {
+  const server = String((req.body as any)?.server_name || "").trim();
+  const snapshot_at = String((req.body as any)?.snapshot_at || "").trim();
+
+  if (!server || !snapshot_at) {
+    return res.status(400).type("html").send(`
+      <p>Missing server_name or snapshot_at</p>
+      <p><a href="/snapshots">Back</a></p>
+    `);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const del = await client.query<{ c: string }>(
+      `WITH deleted AS (
+         DELETE FROM uploads
+         WHERE server_name = $1 AND snapshot_at = $2
+         RETURNING id
+       )
+       SELECT COUNT(*)::text AS c FROM deleted`,
+      [server, snapshot_at]
+    );
+
+    await client.query("COMMIT");
+
+    const count = del.rows[0]?.c ?? "0";
+    res.type("html").send(`
+      <p>Deleted uploads: <b>${escapeHtml(count)}</b></p>
+      <p><a href="/snapshots?server=${encodeURIComponent(server)}">Back to snapshots</a></p>
+      <p><a href="/">Home</a></p>
+    `);
+  } catch (e: any) {
+    await client.query("ROLLBACK");
+    console.error(e);
+    res.status(500).type("html").send(`<p>Delete failed: ${escapeHtml(e?.message || "error")}</p><p><a href="/snapshots">Back</a></p>`);
+  } finally {
+    client.release();
+  }
 });
 
 // -------------------- Listen --------------------

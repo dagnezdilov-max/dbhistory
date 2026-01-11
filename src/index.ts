@@ -22,8 +22,21 @@ function escapeHtml(s: string): string {
     .replaceAll("'", "&#039;");
 }
 
-// datetime-local не содержит timezone.
-// Мы трактуем введённое значение как UTC: "2026-01-11T10:00" -> "2026-01-11T10:00Z"
+function formatBytes(bytes: number): string {
+  const abs = Math.abs(bytes);
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let u = 0;
+  let v = abs;
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024;
+    u++;
+  }
+  const sign = bytes < 0 ? "-" : "";
+  const num = u === 0 ? v.toFixed(0) : v.toFixed(2);
+  return `${sign}${num} ${units[u]}`;
+}
+
+// datetime-local: трактуем введённое значение как UTC (добавляем Z)
 function parseDatetimeLocalAsUTC(value?: string): Date | null {
   const v = (value || "").trim();
   if (!v) return null;
@@ -53,15 +66,106 @@ async function resolveUploadMeta(req: express.Request): Promise<UploadMeta> {
   return { server_name: last, snapshot_at };
 }
 
+// ---- Queries for UI
+
+async function getLatestSnapshot(): Promise<{ server_name: string | null; snapshot_at: string } | null> {
+  const r = await pool.query<{ server_name: string | null; snapshot_at: string }>(
+    `SELECT server_name, snapshot_at
+     FROM uploads
+     WHERE snapshot_at IS NOT NULL
+     ORDER BY snapshot_at DESC, uploaded_at DESC
+     LIMIT 1`
+  );
+  return r.rows[0] ?? null;
+}
+
+async function getSnapshotRows(server: string | null, snapshotAtISO: string) {
+  const r = await pool.query<{
+    server_name: string | null;
+    snapshot_at: string;
+    db_name: string;
+    size_bytes: string;
+    size_pretty: string;
+  }>(
+    `
+    SELECT server_name, snapshot_at, db_name, size_bytes::text, size_pretty
+    FROM db_sizes
+    WHERE server_name IS NOT DISTINCT FROM $1
+      AND snapshot_at = $2
+    ORDER BY size_bytes DESC, db_name ASC
+    `,
+    [server, snapshotAtISO]
+  );
+  return r.rows;
+}
+
+// ---- Main page
+
 app.get("/", async (_req, res) => {
   const lastServer = await getLastServer();
+  const latest = await getLatestSnapshot();
+
+  let summaryHtml = `<p style="color:#555">Пока нет срезов. Загрузите файл или вставьте текст ниже.</p>`;
+
+  if (latest) {
+    const rows = await getSnapshotRows(latest.server_name, latest.snapshot_at);
+    const total = rows.reduce((sum, r) => sum + Number(r.size_bytes), 0);
+
+    summaryHtml = `
+      <h3>Последний срез</h3>
+      <p>
+        <b>Server:</b> ${escapeHtml(latest.server_name ?? "(empty)")}
+        &nbsp; | &nbsp;
+        <b>Snapshot:</b> ${escapeHtml(new Date(latest.snapshot_at).toISOString())}
+        &nbsp; | &nbsp;
+        <b>Total:</b> ${escapeHtml(formatBytes(total))}
+      </p>
+
+      <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:900px;">
+        <thead>
+          <tr style="background:#f2f2f2;">
+            <th align="left">Database</th>
+            <th align="right">Size</th>
+            <th align="left">Snapshot (UTC)</th>
+            <th align="left">Server</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (r) => `
+              <tr>
+                <td>${escapeHtml(r.db_name)}</td>
+                <td align="right">${escapeHtml(formatBytes(Number(r.size_bytes)))}</td>
+                <td>${escapeHtml(new Date(r.snapshot_at).toISOString())}</td>
+                <td>${escapeHtml(r.server_name ?? "(empty)")}</td>
+              </tr>`
+            )
+            .join("")}
+          <tr style="background:#fbfbfb;">
+            <td><b>Total</b></td>
+            <td align="right"><b>${escapeHtml(formatBytes(total))}</b></td>
+            <td colspan="2"></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p style="margin-top:10px;">
+        <a href="/charts">Открыть графики</a>
+      </p>
+    `;
+  }
 
   res.type("html").send(`
     <h2>PG Size Tracker</h2>
 
-    <p><b>Загрузка среза</b> (файл или вставка текста). Дата среза и сервер — опциональны.</p>
+    ${summaryHtml}
+
+    <hr/>
+    <h3>Загрузка среза</h3>
     <p style="color:#555">
-      Примечание: поле "Дата среза" (datetime-local) сохраняется как UTC (добавляется суффикс Z).
+      Можно загрузить файл или вставить текст. Дату среза можно задавать для исторических данных.
+      Поле "Дата среза" (datetime-local) сохраняется как UTC (добавляется суффикс Z).
     </p>
 
     <form action="/upload" method="post" enctype="multipart/form-data" style="margin-bottom:16px;">
@@ -91,16 +195,15 @@ app.get("/", async (_req, res) => {
     </form>
 
     <hr/>
-    <p><b>Навигация</b></p>
+    <p><b>API</b></p>
     <ul>
       <li><a href="/api/servers">/api/servers</a></li>
-      <li><a href="/api/databases">/api/databases</a> (latest sizes; можно ?server=...)</li>
-      <li>/api/databases/&lt;name&gt;/history?server=...&limit=200</li>
       <li><a href="/api/diff">/api/diff</a> (delta last vs previous; можно ?server=...)</li>
-      <li><a href="/charts">/charts</a> (графики с переключением серверов)</li>
     </ul>
   `);
 });
+
+// ---- Upload
 
 app.post("/upload", upload.single("file"), async (req, res) => {
   const meta = await resolveUploadMeta(req);
@@ -140,7 +243,6 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     let i = 1;
 
     for (const r of parsed) {
-      // (upload_id, captured_at, snapshot_at, server_name, db_name, size_bytes, size_pretty)
       placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
       values.push(
         uploadId,
@@ -161,15 +263,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     await client.query("COMMIT");
 
-    res.type("html").send(`
-      <h3>Uploaded OK</h3>
-      <p>Server: <b>${escapeHtml(meta.server_name ?? "(empty)")}</b></p>
-      <p>Snapshot at (UTC): <b>${escapeHtml(snapshot_at.toISOString())}</b></p>
-      <p>Rows parsed: <b>${parsed.length}</b></p>
-      <p><a href="/api/databases${meta.server_name ? `?server=${encodeURIComponent(meta.server_name)}` : ""}">See latest sizes</a></p>
-      <p><a href="/charts">Charts</a></p>
-      <p><a href="/">Upload another</a></p>
-    `);
+    res.redirect("/");
   } catch (e: any) {
     await client.query("ROLLBACK");
     console.error(e);
@@ -179,7 +273,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// --- API: servers
+// ---- API
+
 app.get("/api/servers", async (_req, res) => {
   const r = await pool.query<{ server_name: string }>(
     `SELECT DISTINCT server_name
@@ -187,54 +282,61 @@ app.get("/api/servers", async (_req, res) => {
      WHERE server_name IS NOT NULL AND server_name <> ''
      ORDER BY server_name`
   );
-  res.json(r.rows.map(x => x.server_name));
+  res.json(r.rows.map((x) => x.server_name));
 });
 
-// --- API: latest sizes (опционально фильтр по server)
-app.get("/api/databases", async (req, res) => {
+// snapshots list per server (for bar chart dropdown)
+app.get("/api/snapshots", async (req, res) => {
   const server = String(req.query.server || "").trim();
+  if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
 
-  const q = server
-    ? `
-      SELECT DISTINCT ON (db_name)
-        server_name, db_name, size_bytes, size_pretty, snapshot_at
-      FROM db_sizes
-      WHERE server_name = $1
-      ORDER BY db_name, snapshot_at DESC;
+  const r = await pool.query<{ snapshot_at: string }>(
+    `SELECT DISTINCT snapshot_at
+     FROM uploads
+     WHERE server_name = $1 AND snapshot_at IS NOT NULL
+     ORDER BY snapshot_at DESC`,
+    [server]
+  );
+  res.json(r.rows.map((x) => x.snapshot_at));
+});
+
+// rows for a given snapshot (bar chart)
+app.get("/api/snapshot", async (req, res) => {
+  const server = String(req.query.server || "").trim();
+  const snapshot_at = String(req.query.snapshot_at || "").trim();
+  if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
+  if (!snapshot_at) return res.status(400).json({ error: "Please provide ?snapshot_at=..." });
+
+  const r = await pool.query(
     `
-    : `
-      SELECT DISTINCT ON (server_name, db_name)
-        server_name, db_name, size_bytes, size_pretty, snapshot_at
-      FROM db_sizes
-      ORDER BY server_name, db_name, snapshot_at DESC;
-    `;
-
-  const r = server ? await pool.query(q, [server]) : await pool.query(q);
-  res.json(r.rows);
-});
-
-// --- API: history for db (server optional but recommended for charts)
-app.get("/api/databases/:name/history", async (req, res) => {
-  const name = req.params.name;
-  const server = String(req.query.server || "").trim();
-  const limit = Math.min(Number(req.query.limit || 200), 2000);
-
-  if (!server) {
-    return res.status(400).json({ error: "Please provide ?server=..." });
-  }
-
-  const q = `
-    SELECT server_name, db_name, size_bytes, size_pretty, snapshot_at
+    SELECT db_name, size_bytes, snapshot_at
     FROM db_sizes
-    WHERE server_name = $1 AND db_name = $2
-    ORDER BY snapshot_at ASC
-    LIMIT $3;
-  `;
-  const r = await pool.query(q, [server, name, limit]);
+    WHERE server_name = $1 AND snapshot_at = $2
+    ORDER BY size_bytes DESC, db_name ASC
+    `,
+    [server, snapshot_at]
+  );
   res.json(r.rows);
 });
 
-// --- API: diff (latest vs previous) per db, with optional server filter
+// rows for line chart: all dbs across time for a server
+app.get("/api/lines", async (req, res) => {
+  const server = String(req.query.server || "").trim();
+  if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
+
+  const r = await pool.query(
+    `
+    SELECT db_name, snapshot_at, size_bytes
+    FROM db_sizes
+    WHERE server_name = $1
+    ORDER BY snapshot_at ASC, db_name ASC
+    `,
+    [server]
+  );
+  res.json(r.rows);
+});
+
+// diff endpoint (как раньше, но оставим)
 app.get("/api/diff", async (req, res) => {
   const server = String(req.query.server || "").trim();
 
@@ -301,7 +403,8 @@ app.get("/api/diff", async (req, res) => {
   res.json(r.rows);
 });
 
-// --- UI: charts page (servers switch + db switch + chart)
+// ---- Charts page (2 charts + back button)
+
 app.get("/charts", async (_req, res) => {
   res.type("html").send(`
 <!doctype html>
@@ -312,23 +415,28 @@ app.get("/charts", async (_req, res) => {
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+  <div style="margin-bottom:12px;">
+    <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
+  </div>
+
   <h2>DB Size Charts</h2>
 
   <div style="margin-bottom:12px;">
     <label>Server: </label>
     <select id="serverSelect"></select>
-
-    <label style="margin-left:12px;">Database: </label>
-    <select id="dbSelect"></select>
-
-    <button id="reloadBtn" style="margin-left:12px;">Load</button>
+    <button id="reloadBtn" style="margin-left:12px;">Reload</button>
   </div>
 
-  <canvas id="chart" width="1100" height="420"></canvas>
+  <h3>1) Lines: all databases</h3>
+  <canvas id="lineChart" width="1100" height="420"></canvas>
 
-  <p style="color:#555;">
-    Подсказка: загружай исторические файлы, указывая дату среза — график выстроится по snapshot_at.
-  </p>
+  <h3 style="margin-top:28px;">2) Bars: databases for selected snapshot</h3>
+  <div style="margin-bottom:12px;">
+    <label>Snapshot: </label>
+    <select id="snapshotSelect" style="min-width:360px;"></select>
+    <button id="loadBarsBtn" style="margin-left:12px;">Load bars</button>
+  </div>
+  <canvas id="barChart" width="1100" height="420"></canvas>
 
 <script>
 async function fetchJson(url) {
@@ -336,72 +444,80 @@ async function fetchJson(url) {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
-
 function bytesToGB(x) { return x / (1024**3); }
 
-let chart;
+let lineChart, barChart;
 
 async function loadServers() {
   const servers = await fetchJson('/api/servers');
   const sel = document.getElementById('serverSelect');
   sel.innerHTML = '';
-  const optEmpty = document.createElement('option');
-  optEmpty.value = '';
-  optEmpty.textContent = '(empty)';
-  sel.appendChild(optEmpty);
-
   for (const s of servers) {
     const opt = document.createElement('option');
     opt.value = s;
     opt.textContent = s;
     sel.appendChild(opt);
   }
-}
-
-async function loadDatabases(server) {
-  const url = server ? ('/api/databases?server=' + encodeURIComponent(server)) : '/api/databases';
-  const rows = await fetchJson(url);
-  const sel = document.getElementById('dbSelect');
-  sel.innerHTML = '';
-
-  // rows format with server_name+db_name
-  const dbNames = [...new Set(rows.map(r => r.db_name))].sort();
-  for (const n of dbNames) {
+  if (sel.options.length === 0) {
     const opt = document.createElement('option');
-    opt.value = n;
-    opt.textContent = n;
+    opt.value = '';
+    opt.textContent = '(no servers yet)';
     sel.appendChild(opt);
   }
 }
 
-async function loadChart() {
-  const server = document.getElementById('serverSelect').value;
-  const db = document.getElementById('dbSelect').value;
-  if (!server) {
-    alert('Выбери server (для графиков требуется server).');
-    return;
+async function loadSnapshots(server) {
+  const sel = document.getElementById('snapshotSelect');
+  sel.innerHTML = '';
+  if (!server) return;
+  const snaps = await fetchJson('/api/snapshots?server=' + encodeURIComponent(server));
+  for (const s of snaps) {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = new Date(s).toISOString().replace('T',' ').slice(0,19) + 'Z';
+    sel.appendChild(opt);
   }
-  if (!db) return;
+}
 
-  const data = await fetchJson('/api/databases/' + encodeURIComponent(db) + '/history?server=' + encodeURIComponent(server) + '&limit=2000');
+function buildLineDatasets(rows) {
+  // rows: [{db_name, snapshot_at, size_bytes}]
+  const snapshots = [...new Set(rows.map(r => r.snapshot_at))].sort();
+  const dbs = [...new Set(rows.map(r => r.db_name))].sort();
 
-  const labels = data.map(x => new Date(x.snapshot_at).toISOString().slice(0,19).replace('T',' '));
-  const values = data.map(x => bytesToGB(Number(x.size_bytes)));
+  const byKey = new Map();
+  for (const r of rows) {
+    byKey.set(r.db_name + '||' + r.snapshot_at, Number(r.size_bytes));
+  }
 
-  const ctx = document.getElementById('chart');
-  if (chart) chart.destroy();
+  const labels = snapshots.map(s => new Date(s).toISOString().replace('T',' ').slice(0,19) + 'Z');
 
-  chart = new Chart(ctx, {
+  const datasets = dbs.map(db => {
+    const data = snapshots.map(s => {
+      const v = byKey.get(db + '||' + s);
+      return (v === undefined) ? null : bytesToGB(v);
+    });
+    return { label: db, data };
+  });
+
+  return { labels, datasets };
+}
+
+async function loadLines() {
+  const server = document.getElementById('serverSelect').value;
+  if (!server) return;
+
+  const rows = await fetchJson('/api/lines?server=' + encodeURIComponent(server));
+  const { labels, datasets } = buildLineDatasets(rows);
+
+  const ctx = document.getElementById('lineChart');
+  if (lineChart) lineChart.destroy();
+
+  lineChart = new Chart(ctx, {
     type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        label: server + ' / ' + db + ' (GB)',
-        data: values
-      }]
-    },
+    data: { labels, datasets },
     options: {
       responsive: false,
+      plugins: { legend: { display: true } },
       scales: {
         y: { title: { display: true, text: 'GB' } },
         x: { title: { display: true, text: 'snapshot_at (UTC)' } }
@@ -410,18 +526,56 @@ async function loadChart() {
   });
 }
 
-document.getElementById('reloadBtn').addEventListener('click', loadChart);
+async function loadBars() {
+  const server = document.getElementById('serverSelect').value;
+  const snapshot = document.getElementById('snapshotSelect').value;
+  if (!server || !snapshot) return;
+
+  const rows = await fetchJson('/api/snapshot?server=' + encodeURIComponent(server) + '&snapshot_at=' + encodeURIComponent(snapshot));
+  const labels = rows.map(r => r.db_name);
+  const values = rows.map(r => bytesToGB(Number(r.size_bytes)));
+
+  const ctx = document.getElementById('barChart');
+  if (barChart) barChart.destroy();
+
+  barChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: server + ' / ' + (new Date(snapshot).toISOString().slice(0,19)+'Z') + ' (GB)',
+        data: values
+      }]
+    },
+    options: {
+      responsive: false,
+      plugins: { legend: { display: true } },
+      scales: {
+        y: { title: { display: true, text: 'GB' } }
+      }
+    }
+  });
+}
+
+document.getElementById('reloadBtn').addEventListener('click', async () => {
+  await loadSnapshots(document.getElementById('serverSelect').value);
+  await loadLines();
+});
+document.getElementById('loadBarsBtn').addEventListener('click', loadBars);
+
 document.getElementById('serverSelect').addEventListener('change', async (e) => {
-  await loadDatabases(e.target.value);
+  await loadSnapshots(e.target.value);
+  await loadLines();
+  await loadBars();
 });
 
 (async () => {
   await loadServers();
   const serverSel = document.getElementById('serverSelect');
-  // auto select first real server if exists
-  if (serverSel.options.length > 1) serverSel.selectedIndex = 1;
-  await loadDatabases(serverSel.value);
-  await loadChart();
+  if (serverSel.options.length > 0) serverSel.selectedIndex = 0;
+  await loadSnapshots(serverSel.value);
+  await loadLines();
+  await loadBars();
 })();
 </script>
 
@@ -431,4 +585,4 @@ document.getElementById('serverSelect').addEventListener('change', async (e) => 
 });
 
 const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+app.listen(PORT, () => console.log(\`Listening on \${PORT}\`));

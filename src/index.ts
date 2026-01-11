@@ -192,14 +192,14 @@ async function getSnapshotRows(server: string | null, snapshotAtISO: string) {
     server_name: string | null;
     snapshot_at: string;
     db_name: string;
-    size_bytes: string;
+    size_bytes: string; // pg returns bigint as string
   }>(
     `
-    SELECT server_name, snapshot_at, db_name, size_bytes::text
+    SELECT server_name, snapshot_at, db_name, size_bytes
     FROM db_sizes
     WHERE server_name IS NOT DISTINCT FROM $1
       AND snapshot_at = $2
-    ORDER BY size_bytes DESC, db_name ASC
+    ORDER BY size_bytes::bigint DESC, db_name ASC
     `,
     [server, snapshotAtISO]
   );
@@ -216,6 +216,8 @@ app.get("/", async (_req, res) => {
 
   if (latest) {
     const rows = await getSnapshotRows(latest.server_name, latest.snapshot_at);
+    // Extra safety: ensure sorting by size desc (sometimes DB order can be lost if data types differ)
+    rows.sort((a, b) => Number(b.size_bytes) - Number(a.size_bytes) || a.db_name.localeCompare(b.db_name));
     const total = rows.reduce((sum, r) => sum + Number(r.size_bytes), 0);
 
     summaryHtml = `
@@ -703,7 +705,7 @@ document.getElementById('serverSelect').addEventListener('change', async (e) => 
   `);
 });
 
-// -------------------- Diff page (10 snapshots + % + monthly growth) --------------------
+// -------------------- Diff page (10 snapshots + % + monthly growth + totals) --------------------
 
 app.get("/diff", async (req, res) => {
   const serversR = await pool.query<{ server_name: string }>(
@@ -758,7 +760,18 @@ app.get("/diff", async (req, res) => {
     byDb.get(r.db_name)!.set(snapKey(r.snapshot_at), Number(r.size_bytes));
   }
 
-  const dbNames = [...byDb.keys()].sort();
+  const lastKey = snapshotKeys[snapshotKeys.length - 1];
+  const prevKey = snapshotKeys.length >= 2 ? snapshotKeys[snapshotKeys.length - 2] : null;
+
+  // Sort DBs by latest size (largest first)
+  const dbNames = [...byDb.keys()].sort((a, b) => {
+    const ma = byDb.get(a)!;
+    const mb = byDb.get(b)!;
+    const va = ma.get(lastKey) ?? 0;
+    const vb = mb.get(lastKey) ?? 0;
+    if (vb !== va) return vb - va;
+    return a.localeCompare(b);
+  });
 
   const lastSnap = snapshots[snapshots.length - 1];
   const prevSnap = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
@@ -787,9 +800,6 @@ app.get("/diff", async (req, res) => {
     .map((s) => `<th align="right">${escapeHtml(new Date(s).toISOString().slice(0, 10))}</th>`)
     .join("");
 
-  const lastKey = snapshotKeys[snapshotKeys.length - 1];
-  const prevKey = snapshotKeys.length >= 2 ? snapshotKeys[snapshotKeys.length - 2] : null;
-
   const rowsHtml = dbNames
     .map((db) => {
       const m = byDb.get(db)!;
@@ -810,6 +820,29 @@ app.get("/diff", async (req, res) => {
     })
     .join("");
 
+  // TOTAL row (sum across DBs per snapshot)
+  const totalsBySnapshot: number[] = snapshotKeys.map((k) => {
+    let sum = 0;
+    for (const db of dbNames) {
+      const m = byDb.get(db)!;
+      const v = m.get(k);
+      if (v !== undefined) sum += v;
+    }
+    return sum;
+  });
+
+  const totalLast = totalsBySnapshot[totalsBySnapshot.length - 1] ?? null;
+  const totalPrev = totalsBySnapshot.length >= 2 ? totalsBySnapshot[totalsBySnapshot.length - 2] : null;
+
+  const totalRowHtml = `
+    <tr style="background:#fbfbfb;">
+      <td><b>TOTAL</b></td>
+      ${totalsBySnapshot.map((v) => `<td align="right"><b>${escapeHtml(formatBytes(v))}</b></td>`).join("")}
+      <td align="right"><b>${escapeHtml(pctChange(totalLast, totalPrev))}</b></td>
+      <td align="right"><b>${escapeHtml(monthlyGrowth(totalLast, totalPrev))}</b></td>
+    </tr>
+  `;
+
   res.type("html").send(`
     <div style="margin-bottom:12px;">
       <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
@@ -825,7 +858,7 @@ app.get("/diff", async (req, res) => {
     </form>
 
     <p style="color:#555">
-      Columns: 10 snapshots (oldest → newest), then % change (last vs prev), then monthly growth estimate.
+      Sorted by latest size (largest first). Columns: 10 snapshots (oldest → newest), then % change (last vs prev), then monthly growth estimate.
     </p>
 
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:1100px;">
@@ -839,6 +872,7 @@ app.get("/diff", async (req, res) => {
       </thead>
       <tbody>
         ${rowsHtml}
+        ${totalRowHtml}
       </tbody>
     </table>
   `);

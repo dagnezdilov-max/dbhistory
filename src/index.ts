@@ -744,7 +744,7 @@ app.get("/diff", async (req, res) => {
     `
     SELECT db_name, snapshot_at, size_bytes::text
     FROM db_sizes
-    WHERE server_name = $1 AND snapshot_at = ANY($2)
+    WHERE server_name = $1 AND snapshot_at = ANY($2::timestamptz[])
     `,
     [server, snapshots]
   );

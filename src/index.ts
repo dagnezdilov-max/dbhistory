@@ -1,1128 +1,984 @@
 import express from "express";
+import cookieParser from "cookie-parser";
 import multer from "multer";
-import crypto from "crypto";
-import { pool } from "./db";
-import { parsePgSizeOutput } from "./parser";
+import { Pool } from "pg";
 
+/**
+ * DBHistory (Render + Postgres)
+ * - Auth (simple password)
+ * - Ingest:
+ *    * UI paste text: POST /ingest-text (urlencoded)  ✅ no multipart/busboy
+ *    * UI file upload: POST /upload (multipart)       ✅ uses multer
+ *    * API ingest: POST /api/ingest (text/plain)      ✅ for automation
+ * - Pages:
+ *    * / (main)
+ *    * /charts
+ *    * /diff
+ *    * /snapshots (+ delete)
+ *    * /login
+ */
+
+// -------------------- Config --------------------
+const PORT = Number(process.env.PORT || 3000);
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const INGEST_API_KEY = process.env.INGEST_API_KEY || "";
+const APP_PASSWORD = process.env.APP_PASSWORD || ""; // password for UI
+const COOKIE_SECRET = process.env.COOKIE_SECRET || "change-me";
+
+if (!DATABASE_URL) {
+  // Render provides DATABASE_URL for Postgres.
+  console.warn("WARNING: DATABASE_URL is empty.");
+}
+if (!APP_PASSWORD) {
+  console.warn("WARNING: APP_PASSWORD is empty. UI will be unprotected.");
+}
+if (!INGEST_API_KEY) {
+  console.warn("WARNING: INGEST_API_KEY is empty. /api/ingest will be unprotected.");
+}
+
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+// -------------------- App --------------------
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
-app.use(express.urlencoded({ extended: true }));
+// IMPORTANT: for paste-text form we use urlencoded; this avoids busboy/multipart issues.
+app.use(express.urlencoded({ extended: false, limit: "10mb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.text({ type: "text/plain", limit: "10mb" }));
 
-// -------------------- Helpers --------------------
+app.use(cookieParser(COOKIE_SECRET));
 
-function escapeHtml(s: string): string {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+// -------------------- DB init --------------------
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS snapshots (
+      id BIGSERIAL PRIMARY KEY,
+      snapshot_at TIMESTAMPTZ NOT NULL,
+      server_name TEXT NULL
+    );
+  `);
+
+  // Optional uniqueness (helps avoid duplicates on same day+server).
+  // If you already have this constraint, this will do nothing.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'snapshots_snapshot_at_server_idx'
+      ) THEN
+        CREATE INDEX snapshots_snapshot_at_server_idx ON snapshots (snapshot_at DESC, server_name);
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS db_sizes (
+      id BIGSERIAL PRIMARY KEY,
+      snapshot_id BIGINT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+      datname TEXT NOT NULL,
+      size_pretty TEXT NOT NULL,
+      size_bytes BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'db_sizes_snapshot_datname_idx'
+      ) THEN
+        CREATE INDEX db_sizes_snapshot_datname_idx ON db_sizes (snapshot_id, datname);
+      END IF;
+    END $$;
+  `);
 }
+ensureSchema().catch((e) => console.error("Schema init failed:", e));
 
-function formatBytes(bytes: number): string {
-  const abs = Math.abs(bytes);
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  let u = 0;
-  let v = abs;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u++;
-  }
-  const sign = bytes < 0 ? "-" : "";
-  const num = u === 0 ? v.toFixed(0) : v.toFixed(2);
-  return `${sign}${num} ${units[u]}`;
+// -------------------- Auth --------------------
+function isAuthed(req: express.Request): boolean {
+  if (!APP_PASSWORD) return true; // allow if no password configured
+  return req.cookies?.auth === "1";
 }
-
-// Normalize timestamps so that Map keys always match even if PG returns different string formats
-function snapKey(x: string): number {
-  return new Date(x).getTime(); // epoch ms
-}
-
-// datetime-local: interpret as UTC by appending Z
-function parseDatetimeLocalAsUTC(value?: string): Date | null {
-  const v = (value || "").trim();
-  if (!v) return null;
-  const d = new Date(v + "Z");
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
-}
-
-async function getLastServer(): Promise<string | null> {
-  const r = await pool.query<{ server_name: string }>(
-    `SELECT server_name
-     FROM uploads
-     WHERE server_name IS NOT NULL AND server_name <> ''
-     ORDER BY uploaded_at DESC
-     LIMIT 1`
-  );
-  return r.rows[0]?.server_name ?? null;
-}
-
-// -------------------- Auth (simple signed cookie) --------------------
-
-const COOKIE_NAME = "auth";
-const PASSWORD = (process.env.APP_PASSWORD || "").trim();
-const AUTH_SECRET = (process.env.AUTH_SECRET || PASSWORD).trim();
-const SESSION_DAYS = 7;
-
-if (!PASSWORD) {
-  console.warn("WARNING: APP_PASSWORD is not set. Login will fail until you set it in Render env.");
-}
-
-function parseCookies(header?: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  const h = header || "";
-  for (const part of h.split(";")) {
-    const [k, ...rest] = part.trim().split("=");
-    if (!k) continue;
-    out[k] = decodeURIComponent(rest.join("=") || "");
-  }
-  return out;
-}
-
-function b64url(input: Buffer | string): string {
-  const b = Buffer.isBuffer(input) ? input : Buffer.from(input, "utf-8");
-  return b.toString("base64").replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-}
-
-function unb64url(s: string): Buffer {
-  const pad = "=".repeat((4 - (s.length % 4)) % 4);
-  const x = (s + pad).replaceAll("-", "+").replaceAll("_", "/");
-  return Buffer.from(x, "base64");
-}
-
-function sign(dataB64: string): string {
-  return b64url(crypto.createHmac("sha256", AUTH_SECRET).update(dataB64).digest());
-}
-
-function makeToken(): string {
-  const exp = Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000;
-  const payload = b64url(JSON.stringify({ exp }));
-  const sig = sign(payload);
-  return `${payload}.${sig}`;
-}
-
-function verifyToken(token: string): boolean {
-  const parts = token.split(".");
-  if (parts.length !== 2) return false;
-  const [payload, sig] = parts;
-  const expected = sign(payload);
-
-  // timingSafeEqual needs same length
-  if (sig.length !== expected.length) return false;
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
-
-  const obj = JSON.parse(unb64url(payload).toString("utf-8"));
-  if (!obj?.exp || typeof obj.exp !== "number") return false;
-  return Date.now() < obj.exp;
-}
-
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  if (req.path === "/login" || req.path === "/logout" || req.path === "/api/ingest") return next();
-
-  const cookies = parseCookies(req.headers.cookie);
-  const token = cookies[COOKIE_NAME];
-
-  if (token && verifyToken(token)) return next();
-
-  if (req.path.startsWith("/api/")) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
+  if (isAuthed(req)) return next();
   return res.redirect("/login");
 }
 
-app.get("/login", (_req, res) => {
-  res.type("html").send(`
-    <h2>Login</h2>
-    <form method="post" action="/login">
-      <div style="margin-bottom:8px;">
-        <label>Password:</label>
-        <input type="password" name="password" style="width:260px;" autofocus />
-      </div>
-      <button type="submit">Sign in</button>
-    </form>
-  `);
-});
-
-app.post("/login", async (req, res) => {
-  const pw = String((req.body as any)?.password || "");
-  if (!PASSWORD || pw !== PASSWORD) {
-    return res.status(401).type("html").send(`
-      <h2>Login</h2>
-      <p style="color:red;">Wrong password</p>
-      <a href="/login">Try again</a>
-    `);
-  }
-
-  const token = makeToken();
-  res.setHeader(
-    "Set-Cookie",
-    `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${
-      SESSION_DAYS * 24 * 60 * 60
-    }`
-  );
-  res.redirect("/");
-});
-
-app.get("/logout", (_req, res) => {
-  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`);
-  res.redirect("/login");
-});
-
-// Apply auth to everything below
-app.use(requireAuth);
-
-// -------------------- Ingest API (for automation) --------------------
-// Accepts plain text (psql output) and stores it as a snapshot.
-// Auth: X-API-Key header must match INGEST_API_KEY environment variable.
-// Usage example:
-//   POST /api/ingest?server_name=prod-1&snapshot_at=2026-01-11T00:00:00Z
-//   Header: X-API-Key: <key>
-//   Body: lines like "dbname | 37 MB"
-
-const INGEST_API_KEY = String(process.env.INGEST_API_KEY || "").trim();
-
-// Accept any text body. (Must be registered before the route)
-app.use(express.text({ type: "*/*", limit: "10mb" }));
-
-app.post("/api/ingest", async (req, res) => {
-  const apiKey = String(req.header("x-api-key") || "");
-  if (!INGEST_API_KEY || apiKey !== INGEST_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  const server_name = String(req.query.server_name || "").trim() || null;
-
-  // snapshot_at can be ISO (recommended). If not provided, use now().
-  const snapshotRaw = String(req.query.snapshot_at || "").trim();
-  const snapshot_at = snapshotRaw ? new Date(snapshotRaw) : new Date();
-  if (Number.isNaN(snapshot_at.getTime())) {
-    return res.status(400).json({ error: "Invalid snapshot_at. Use ISO like 2026-01-11T00:00:00Z" });
-  }
-
-  const content = typeof req.body === "string" ? req.body : "";
-  if (!content.trim()) {
-    return res.status(400).json({ error: "Empty body" });
-  }
-
-  const parsed = parsePgSizeOutput(content);
-  if (parsed.length === 0) {
-    return res.status(400).json({ error: "Parse failed" });
-  }
-
-  const originalName = "api-ingest";
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const up = await client.query<{ id: string }>(
-      `INSERT INTO uploads (original_name, content, snapshot_at, server_name)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id`,
-      [originalName, content, snapshot_at.toISOString(), server_name]
-    );
-    const uploadId = up.rows[0].id;
-
-    const values: Array<string | number | null> = [];
-    const placeholders: string[] = [];
-    let i = 1;
-
-    for (const r of parsed) {
-      placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
-      values.push(
-        uploadId,
-        snapshot_at.toISOString(),
-        snapshot_at.toISOString(),
-        server_name,
-        r.db_name,
-        r.size_bytes,
-        r.size_pretty
-      );
-    }
-
-    await client.query(
-      `INSERT INTO db_sizes (upload_id, captured_at, snapshot_at, server_name, db_name, size_bytes, size_pretty)
-       VALUES ${placeholders.join(", ")}`,
-      values
-    );
-
-    await client.query("COMMIT");
-
-    return res.json({
-      ok: true,
-      rows: parsed.length,
-      server_name,
-      snapshot_at: snapshot_at.toISOString(),
-    });
-  } catch (e: any) {
-    await client.query("ROLLBACK");
-    console.error(e);
-    return res.status(500).json({ error: e?.message || "failed" });
-  } finally {
-    client.release();
-  }
-});
-
-
-// -------------------- DB helpers for UI --------------------
-
-async function getLatestSnapshot(): Promise<{ server_name: string | null; snapshot_at: string } | null> {
-  const r = await pool.query<{ server_name: string | null; snapshot_at: string }>(
-    `SELECT server_name, snapshot_at
-     FROM uploads
-     WHERE snapshot_at IS NOT NULL
-     ORDER BY snapshot_at DESC, uploaded_at DESC
-     LIMIT 1`
-  );
-  return r.rows[0] ?? null;
-}
-
-async function getSnapshotRows(server: string | null, snapshotAtISO: string) {
-  const r = await pool.query<{
-    server_name: string | null;
-    snapshot_at: string;
-    db_name: string;
-    size_bytes: string;
-  }>(
-    `
-    SELECT server_name, snapshot_at, db_name, size_bytes::text
-    FROM db_sizes
-    WHERE server_name IS NOT DISTINCT FROM $1
-      AND snapshot_at = $2
-    ORDER BY size_bytes DESC, db_name ASC
-    `,
-    [server, snapshotAtISO]
-  );
-  return r.rows;
-}
-
-// -------------------- Main page --------------------
-
-app.get("/", async (_req, res) => {
-  const lastServer = await getLastServer();
-  const latest = await getLatestSnapshot();
-
-  let summaryHtml = `<p style="color:#555">Пока нет срезов. Загрузите файл или вставьте текст ниже.</p>`;
-
-  if (latest) {
-    const rows = await getSnapshotRows(latest.server_name, latest.snapshot_at);
-    const total = rows.reduce((sum, r) => sum + Number(r.size_bytes), 0);
-
-    summaryHtml = `
-      <h3>Последний срез</h3>
-      <p>
-        <b>Server:</b> ${escapeHtml(latest.server_name ?? "(empty)")}
-        &nbsp; | &nbsp;
-        <b>Snapshot:</b> ${escapeHtml(new Date(latest.snapshot_at).toISOString())}
-        &nbsp; | &nbsp;
-        <b>Total:</b> ${escapeHtml(formatBytes(total))}
-      </p>
-
-      <p>
-        <a href="/charts">Charts</a> |
-        <a href="/diff">Diff</a> |
-        <a href="/snapshots">Snapshots</a> |
-        <a href="/logout">Logout</a>
-      </p>
-
-      <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:900px;">
-        <thead>
-          <tr style="background:#f2f2f2;">
-            <th align="left">Database</th>
-            <th align="right">Size</th>
-            <th align="left">Snapshot (UTC)</th>
-            <th align="left">Server</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows
-            .map(
-              (r) => `
-              <tr>
-                <td>${escapeHtml(r.db_name)}</td>
-                <td align="right">${escapeHtml(formatBytes(Number(r.size_bytes)))}</td>
-                <td>${escapeHtml(new Date(r.snapshot_at).toISOString())}</td>
-                <td>${escapeHtml(r.server_name ?? "(empty)")}</td>
-              </tr>`
-            )
-            .join("")}
-          <tr style="background:#fbfbfb;">
-            <td><b>Total</b></td>
-            <td align="right"><b>${escapeHtml(formatBytes(total))}</b></td>
-            <td colspan="2"></td>
-          </tr>
-        </tbody>
-      </table>
-    `;
-  } else {
-    summaryHtml = `
-      <p>
-        <a href="/charts">Charts</a> |
-        <a href="/diff">Diff</a> |
-        <a href="/snapshots">Snapshots</a> |
-        <a href="/logout">Logout</a>
-      </p>
-      <p style="color:#555">Пока нет срезов. Загрузите файл или вставьте текст ниже.</p>
-    `;
-  }
-
-  res.type("html").send(`
-    <h2>PG Size Tracker</h2>
-
-    ${summaryHtml}
-
-    <hr/>
-    <h3>Загрузка среза</h3>
-    <p style="color:#555">
-      Можно загрузить файл или вставить текст. Дату среза можно задавать для исторических данных.
-      Поле "Дата среза" (datetime-local) сохраняется как UTC (добавляется суффикс Z).
-    </p>
-
-    <form action="/upload" method="post" enctype="multipart/form-data" style="margin-bottom:16px;">
-      <div style="margin-bottom:8px;">
-        <label>Сервер (опционально): </label>
-        <input name="server_name" placeholder="например: prod-frankfurt-1"
-               value="${escapeHtml(lastServer ?? "")}" style="width:360px;" />
-        <small style="color:#555">если пусто — используем последнее значение или оставим пустым</small>
-      </div>
-
-      <div style="margin-bottom:8px;">
-        <label>Дата среза (опционально): </label>
-        <input type="datetime-local" name="snapshot_at" />
-      </div>
-
-      <div style="margin-bottom:8px;">
-        <label>Файл:</label>
-        <input type="file" name="file" accept=".txt,text/plain" />
-      </div>
-
-      <div style="margin-bottom:8px;">
-        <label>или вставь текст:</label><br/>
-        <textarea name="text" rows="10" cols="120" placeholder="datname | pg_size_pretty ..."></textarea>
-      </div>
-
-      <button type="submit">Upload</button>
-    </form>
-  `);
-});
-
-// -------------------- Upload --------------------
-
-type UploadMeta = {
-  server_name: string | null;
-  snapshot_at: Date | null;
-};
-
-async function resolveUploadMeta(req: express.Request): Promise<UploadMeta> {
-  const snapshot_at = parseDatetimeLocalAsUTC(String((req.body as any)?.snapshot_at || ""));
-  const providedServer = String((req.body as any)?.server_name || "").trim();
-  if (providedServer) return { server_name: providedServer, snapshot_at };
-
-  const last = await getLastServer();
-  return { server_name: last, snapshot_at };
-}
-
-app.post("/upload", upload.single("file"), async (req, res) => {
-  const meta = await resolveUploadMeta(req);
-
-  const bodyText = String((req.body as any)?.text || "");
-  const fileText = req.file ? req.file.buffer.toString("utf-8") : "";
-
-  const content = fileText.trim().length > 0 ? fileText : bodyText;
-  const originalName = req.file?.originalname || "pasted-text";
-
-  if (!content || content.trim().length === 0) {
-    return res.status(400).send("Нет данных: загрузите файл или вставьте текст.");
-  }
-
-  const parsed = parsePgSizeOutput(content);
-  if (parsed.length === 0) {
-    return res.status(400).send("Не удалось распарсить строки. Проверь формат текста.");
-  }
-
-  const snapshot_at = meta.snapshot_at ?? new Date();
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const up = await client.query<{ id: string }>(
-      `INSERT INTO uploads (original_name, content, snapshot_at, server_name)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id`,
-      [originalName, content, snapshot_at.toISOString(), meta.server_name]
-    );
-    const uploadId = up.rows[0].id;
-
-    const values: Array<string | number | null> = [];
-    const placeholders: string[] = [];
-    let i = 1;
-
-    for (const r of parsed) {
-      placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
-      values.push(
-        uploadId,
-        snapshot_at.toISOString(),
-        snapshot_at.toISOString(),
-        meta.server_name,
-        r.db_name,
-        r.size_bytes,
-        r.size_pretty
-      );
-    }
-
-    await client.query(
-      `INSERT INTO db_sizes (upload_id, captured_at, snapshot_at, server_name, db_name, size_bytes, size_pretty)
-       VALUES ${placeholders.join(", ")}`,
-      values
-    );
-
-    await client.query("COMMIT");
-    res.redirect("/");
-  } catch (e: any) {
-    await client.query("ROLLBACK");
-    console.error(e);
-    res.status(500).send("Upload failed: " + e?.message);
-  } finally {
-    client.release();
-  }
-});
-
-// -------------------- API --------------------
-
-app.get("/api/servers", async (_req, res) => {
-  const r = await pool.query<{ server_name: string }>(
-    `SELECT DISTINCT server_name
-     FROM uploads
-     WHERE server_name IS NOT NULL AND server_name <> ''
-     ORDER BY server_name`
-  );
-  res.json(r.rows.map((x) => x.server_name));
-});
-
-app.get("/api/snapshots", async (req, res) => {
-  const server = String(req.query.server || "").trim();
-  if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
-
-  const r = await pool.query<{ snapshot_at: string }>(
-    `SELECT DISTINCT snapshot_at
-     FROM uploads
-     WHERE server_name = $1 AND snapshot_at IS NOT NULL
-     ORDER BY snapshot_at DESC`,
-    [server]
-  );
-  res.json(r.rows.map((x) => x.snapshot_at));
-});
-
-app.get("/api/snapshot", async (req, res) => {
-  const server = String(req.query.server || "").trim();
-  const snapshot_at = String(req.query.snapshot_at || "").trim();
-  if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
-  if (!snapshot_at) return res.status(400).json({ error: "Please provide ?snapshot_at=..." });
-
-  const r = await pool.query(
-    `
-    SELECT db_name, size_bytes, snapshot_at
-    FROM db_sizes
-    WHERE server_name = $1 AND snapshot_at = $2
-    ORDER BY size_bytes DESC, db_name ASC
-    `,
-    [server, snapshot_at]
-  );
-  res.json(r.rows);
-});
-
-app.get("/api/lines", async (req, res) => {
-  const server = String(req.query.server || "").trim();
-  if (!server) return res.status(400).json({ error: "Please provide ?server=..." });
-
-  const r = await pool.query(
-    `
-    SELECT db_name, snapshot_at, size_bytes
-    FROM db_sizes
-    WHERE server_name = $1
-    ORDER BY snapshot_at ASC, db_name ASC
-    `,
-    [server]
-  );
-  res.json(r.rows);
-});
-
-app.get("/api/diff", async (req, res) => {
-  const server = String(req.query.server || "").trim();
-
-  const q = server
-    ? `
-      WITH ranked AS (
-        SELECT
-          server_name, db_name, size_bytes, size_pretty, snapshot_at,
-          ROW_NUMBER() OVER (PARTITION BY server_name, db_name ORDER BY snapshot_at DESC) AS rn
-        FROM db_sizes
-        WHERE server_name = $1
-      )
-      SELECT
-        cur.server_name,
-        cur.db_name,
-        cur.size_bytes AS latest_bytes,
-        cur.size_pretty AS latest_pretty,
-        cur.snapshot_at AS latest_at,
-        prev.size_bytes AS prev_bytes,
-        prev.size_pretty AS prev_pretty,
-        prev.snapshot_at AS prev_at,
-        (cur.size_bytes - COALESCE(prev.size_bytes, cur.size_bytes)) AS delta_bytes,
-        CASE
-          WHEN prev.size_bytes IS NULL OR prev.size_bytes = 0 THEN NULL
-          ELSE ( (cur.size_bytes - prev.size_bytes)::numeric / prev.size_bytes::numeric ) * 100
-        END AS delta_percent
-      FROM ranked cur
-      LEFT JOIN ranked prev
-        ON prev.server_name = cur.server_name AND prev.db_name = cur.db_name AND prev.rn = 2
-      WHERE cur.rn = 1
-      ORDER BY delta_bytes DESC;
-    `
-    : `
-      WITH ranked AS (
-        SELECT
-          server_name, db_name, size_bytes, size_pretty, snapshot_at,
-          ROW_NUMBER() OVER (PARTITION BY server_name, db_name ORDER BY snapshot_at DESC) AS rn
-        FROM db_sizes
-      )
-      SELECT
-        cur.server_name,
-        cur.db_name,
-        cur.size_bytes AS latest_bytes,
-        cur.size_pretty AS latest_pretty,
-        cur.snapshot_at AS latest_at,
-        prev.size_bytes AS prev_bytes,
-        prev.size_pretty AS prev_pretty,
-        prev.snapshot_at AS prev_at,
-        (cur.size_bytes - COALESCE(prev.size_bytes, cur.size_bytes)) AS delta_bytes,
-        CASE
-          WHEN prev.size_bytes IS NULL OR prev.size_bytes = 0 THEN NULL
-          ELSE ( (cur.size_bytes - prev.size_bytes)::numeric / prev.size_bytes::numeric ) * 100
-        END AS delta_percent
-      FROM ranked cur
-      LEFT JOIN ranked prev
-        ON prev.server_name IS NOT DISTINCT FROM cur.server_name
-       AND prev.db_name = cur.db_name
-       AND prev.rn = 2
-      WHERE cur.rn = 1
-      ORDER BY delta_bytes DESC;
-    `;
-
-  const r = server ? await pool.query(q, [server]) : await pool.query(q);
-  res.json(r.rows);
-});
-
-// -------------------- Charts page (2 charts + back button) --------------------
-
-app.get("/charts", async (_req, res) => {
+app.get("/login", (req, res) => {
+  const msg = typeof req.query?.err === "string" ? req.query.err : "";
   res.type("html").send(`
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>DB Size Charts</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <title>Login</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:520px}
+    input{padding:10px;width:100%;box-sizing:border-box;margin:8px 0}
+    button{padding:10px 14px}
+    .err{color:#b00020}
+  </style>
 </head>
 <body>
-  <div style="margin-bottom:12px;">
-    <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
-    <a href="/logout" style="margin-left:10px;">Logout</a>
-  </div>
-
-  <h2>DB Size Charts</h2>
-
-  <div style="margin-bottom:12px;">
-    <label>Server: </label>
-    <select id="serverSelect"></select>
-    <button id="reloadBtn" style="margin-left:12px;">Reload</button>
-  </div>
-
-  <h3>1) Lines: all databases</h3>
-  <canvas id="lineChart" width="1100" height="420"></canvas>
-
-  <h3 style="margin-top:28px;">2) Bars: databases for selected snapshot</h3>
-  <div style="margin-bottom:12px;">
-    <label>Snapshot: </label>
-    <select id="snapshotSelect" style="min-width:360px;"></select>
-    <button id="loadBarsBtn" style="margin-left:12px;">Load bars</button>
-  </div>
-  <canvas id="barChart" width="1100" height="420"></canvas>
-
-<script>
-async function fetchJson(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-function bytesToGB(x) { return x / (1024**3); }
-
-let lineChart, barChart;
-
-async function loadServers() {
-  const servers = await fetchJson('/api/servers');
-  const sel = document.getElementById('serverSelect');
-  sel.innerHTML = '';
-  for (const s of servers) {
-    const opt = document.createElement('option');
-    opt.value = s;
-    opt.textContent = s;
-    sel.appendChild(opt);
-  }
-  if (sel.options.length === 0) {
-    const opt = document.createElement('option');
-    opt.value = '';
-    opt.textContent = '(no servers yet)';
-    sel.appendChild(opt);
-  }
-}
-
-async function loadSnapshots(server) {
-  const sel = document.getElementById('snapshotSelect');
-  sel.innerHTML = '';
-  if (!server) return;
-  const snaps = await fetchJson('/api/snapshots?server=' + encodeURIComponent(server));
-  for (const s of snaps) {
-    const opt = document.createElement('option');
-    opt.value = s;
-    opt.textContent = new Date(s).toISOString().replace('T',' ').slice(0,19) + 'Z';
-    sel.appendChild(opt);
-  }
-}
-
-function buildLineDatasets(rows) {
-  const snapshots = [...new Set(rows.map(r => r.snapshot_at))].sort();
-  const dbs = [...new Set(rows.map(r => r.db_name))].sort();
-
-  const byKey = new Map();
-  for (const r of rows) {
-    byKey.set(r.db_name + '||' + r.snapshot_at, Number(r.size_bytes));
-  }
-
-  const labels = snapshots.map(s => new Date(s).toISOString().replace('T',' ').slice(0,19) + 'Z');
-
-  const datasets = dbs.map(db => {
-    const data = snapshots.map(s => {
-      const v = byKey.get(db + '||' + s);
-      return (v === undefined) ? null : bytesToGB(v);
-    });
-    return { label: db, data };
-  });
-
-  return { labels, datasets };
-}
-
-async function loadLines() {
-  const server = document.getElementById('serverSelect').value;
-  if (!server) return;
-
-  const rows = await fetchJson('/api/lines?server=' + encodeURIComponent(server));
-  const built = buildLineDatasets(rows);
-
-  const ctx = document.getElementById('lineChart');
-  if (lineChart) lineChart.destroy();
-
-  lineChart = new Chart(ctx, {
-    type: 'line',
-    data: { labels: built.labels, datasets: built.datasets },
-    options: {
-      responsive: false,
-      plugins: { legend: { display: true } },
-      scales: {
-        y: { title: { display: true, text: 'GB' } },
-        x: { title: { display: true, text: 'snapshot_at (UTC)' } }
-      }
-    }
-  });
-}
-
-async function loadBars() {
-  const server = document.getElementById('serverSelect').value;
-  const snapshot = document.getElementById('snapshotSelect').value;
-  if (!server || !snapshot) return;
-
-  const rows = await fetchJson('/api/snapshot?server=' + encodeURIComponent(server) + '&snapshot_at=' + encodeURIComponent(snapshot));
-  const labels = rows.map(r => r.db_name);
-  const values = rows.map(r => bytesToGB(Number(r.size_bytes)));
-
-  const ctx = document.getElementById('barChart');
-  if (barChart) barChart.destroy();
-
-  barChart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels,
-      datasets: [{
-        label: server + ' / ' + (new Date(snapshot).toISOString().slice(0,19)+'Z') + ' (GB)',
-        data: values
-      }]
-    },
-    options: {
-      responsive: false,
-      plugins: { legend: { display: true } },
-      scales: {
-        y: { title: { display: true, text: 'GB' } }
-      }
-    }
-  });
-}
-
-document.getElementById('reloadBtn').addEventListener('click', async () => {
-  await loadSnapshots(document.getElementById('serverSelect').value);
-  await loadLines();
-});
-document.getElementById('loadBarsBtn').addEventListener('click', loadBars);
-
-document.getElementById('serverSelect').addEventListener('change', async (e) => {
-  await loadSnapshots(e.target.value);
-  await loadLines();
-  await loadBars();
-});
-
-(async () => {
-  await loadServers();
-  const serverSel = document.getElementById('serverSelect');
-  if (serverSel.options.length > 0) serverSel.selectedIndex = 0;
-  await loadSnapshots(serverSel.value);
-  await loadLines();
-  await loadBars();
-})();
-</script>
-
+  <h2>DBHistory</h2>
+  ${msg ? `<p class="err">${escapeHtml(msg)}</p>` : ""}
+  <form method="post" action="/login">
+    <label>Password</label>
+    <input type="password" name="password" autocomplete="current-password" required />
+    <button type="submit">Sign in</button>
+  </form>
 </body>
 </html>
-  `);
+`);
 });
 
-// -------------------- Diff page (10 snapshots + % + monthly growth + totals) --------------------
-
-app.get("/diff", async (req, res) => {
-  const serversR = await pool.query<{ server_name: string }>(
-    `SELECT DISTINCT server_name
-     FROM uploads
-     WHERE server_name IS NOT NULL AND server_name <> ''
-     ORDER BY server_name`
-  );
-  const servers = serversR.rows.map((x) => x.server_name);
-
-  const server = String(req.query.server || servers[0] || "").trim();
-  if (!server) {
-    return res.type("html").send(`
-      <p>No servers yet.</p>
-      <p><a href="/">Back</a></p>
-    `);
+app.post("/login", (req, res) => {
+  const pw = String((req.body as any)?.password || "");
+  if (!APP_PASSWORD || pw === APP_PASSWORD) {
+    res.cookie("auth", "1", { httpOnly: true, sameSite: "lax", secure: true });
+    return res.redirect("/");
   }
-
-  const snapsR = await pool.query<{ snapshot_at: string }>(
-    `SELECT DISTINCT snapshot_at
-     FROM uploads
-     WHERE server_name = $1 AND snapshot_at IS NOT NULL
-     ORDER BY snapshot_at DESC
-     LIMIT 10`,
-    [server]
-  );
-
-  const snapshotsDesc = snapsR.rows.map((x) => x.snapshot_at);
-  const snapshots = [...snapshotsDesc].reverse(); // oldest -> newest
-  const snapshotKeys = snapshots.map(snapKey);
-
-  if (snapshots.length === 0) {
-    return res.type("html").send(`
-      <p>No snapshots for server ${escapeHtml(server)}.</p>
-      <p><a href="/">Back</a></p>
-    `);
-  }
-
-  const dataR = await pool.query<{ db_name: string; snapshot_at: string; size_bytes: string }>(
-    `
-    SELECT db_name, snapshot_at, size_bytes::text
-    FROM db_sizes
-    WHERE server_name = $1 AND snapshot_at = ANY($2::timestamptz[])
-    `,
-    [server, snapshots]
-  );
-
-  // db -> (snapKey -> bytes)
-  const byDb = new Map<string, Map<number, number>>();
-  for (const r of dataR.rows) {
-    if (!byDb.has(r.db_name)) byDb.set(r.db_name, new Map<number, number>());
-    byDb.get(r.db_name)!.set(snapKey(r.snapshot_at), Number(r.size_bytes));
-  }
-
-  const lastKey = snapshotKeys[snapshotKeys.length - 1];
-  const prevKey = snapshotKeys.length >= 2 ? snapshotKeys[snapshotKeys.length - 2] : null;
-
-  // Sort DBs by latest size (largest first)
-  const dbNames = [...byDb.keys()].sort((a, b) => {
-    const ma = byDb.get(a)!;
-    const mb = byDb.get(b)!;
-    const va = ma.get(lastKey) ?? 0;
-    const vb = mb.get(lastKey) ?? 0;
-    if (vb !== va) return vb - va;
-    return a.localeCompare(b);
-  });
-
-  const lastSnap = snapshots[snapshots.length - 1];
-  const prevSnap = snapshots.length >= 2 ? snapshots[snapshots.length - 2] : null;
-
-  const daysDiff =
-    prevSnap ? (new Date(lastSnap).getTime() - new Date(prevSnap).getTime()) / (1000 * 60 * 60 * 24) : null;
-
-  function pctChange(cur: number | null, prevv: number | null): string {
-    if (cur === null || prevv === null || prevv === 0) return "";
-    const pct = ((cur - prevv) / prevv) * 100;
-    return pct.toFixed(2) + "%";
-  }
-
-  function monthlyGrowth(cur: number | null, prevv: number | null): string {
-    if (cur === null || prevv === null || !daysDiff || daysDiff <= 0) return "";
-    const delta = cur - prevv;
-    const perMonth = (delta / daysDiff) * 30; // approximate 30-day month
-    return formatBytes(perMonth);
-  }
-
-  const serverOptions = servers
-    .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s)}</option>`)
-    .join("");
-
-  const headerSnapshots = snapshots
-    .map((s) => `<th align="right">${escapeHtml(new Date(s).toISOString().slice(0, 10))}</th>`)
-    .join("");
-
-  const rowsHtml = dbNames
-    .map((db) => {
-      const m = byDb.get(db)!;
-
-      const values = snapshotKeys.map((k) => (m.has(k) ? m.get(k)! : null));
-
-      const cur = m.has(lastKey) ? m.get(lastKey)! : null;
-      const prv = prevKey !== null && m.has(prevKey) ? m.get(prevKey)! : null;
-
-      return `
-        <tr>
-          <td>${escapeHtml(db)}</td>
-          ${values.map((v) => `<td align="right">${v === null ? "" : escapeHtml(formatBytes(v))}</td>`).join("")}
-          <td align="right">${escapeHtml(pctChange(cur, prv))}</td>
-          <td align="right">${escapeHtml(monthlyGrowth(cur, prv))}</td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  // TOTAL row (sum across DBs per snapshot)
-  const totalsBySnapshot: number[] = snapshotKeys.map((k) => {
-    let sum = 0;
-    for (const db of dbNames) {
-      const m = byDb.get(db)!;
-      const v = m.get(k);
-      if (v !== undefined) sum += v;
-    }
-    return sum;
-  });
-
-  const totalLast = totalsBySnapshot[totalsBySnapshot.length - 1] ?? null;
-  const totalPrev = totalsBySnapshot.length >= 2 ? totalsBySnapshot[totalsBySnapshot.length - 2] : null;
-
-  const totalRowHtml = `
-    <tr style="background:#fbfbfb;">
-      <td><b>TOTAL</b></td>
-      ${totalsBySnapshot.map((v) => `<td align="right"><b>${escapeHtml(formatBytes(v))}</b></td>`).join("")}
-      <td align="right"><b>${escapeHtml(pctChange(totalLast, totalPrev))}</b></td>
-      <td align="right"><b>${escapeHtml(monthlyGrowth(totalLast, totalPrev))}</b></td>
-    </tr>
-  `;
-
-  res.type("html").send(`
-    <div style="margin-bottom:12px;">
-      <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
-      <a href="/logout" style="margin-left:10px;">Logout</a>
-    </div>
-
-    <h2>Diff (last 10 snapshots)</h2>
-
-    <form method="get" action="/diff" style="margin-bottom:12px;">
-      <label>Server: </label>
-      <select name="server">${serverOptions}</select>
-      <button type="submit" style="margin-left:10px;">Load</button>
-    </form>
-
-    <p style="color:#555">
-      Sorted by latest size (largest first). Columns: 10 snapshots (oldest → newest), then % change (last vs prev), then monthly growth estimate.
-    </p>
-
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:1100px;">
-      <thead>
-        <tr style="background:#f2f2f2;">
-          <th align="left">Database</th>
-          ${headerSnapshots}
-          <th align="right">% (last vs prev)</th>
-          <th align="right">Monthly growth</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rowsHtml}
-        ${totalRowHtml}
-      </tbody>
-    </table>
-  `);
+  return res.redirect("/login?err=" + encodeURIComponent("Wrong password"));
 });
 
-
-// -------------------- Snapshots manager (delete snapshots) --------------------
-
-app.get("/snapshots", async (req, res) => {
-  const serversR = await pool.query<{ server_name: string }>(
-    `SELECT DISTINCT server_name
-     FROM uploads
-     WHERE server_name IS NOT NULL AND server_name <> ''
-     ORDER BY server_name`
-  );
-  const servers = serversR.rows.map((x) => x.server_name);
-
-  const server = String(req.query.server || servers[0] || "").trim();
-  if (!server) {
-    return res.type("html").send(`
-      <div style="margin-bottom:12px;">
-        <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
-        <a href="/logout" style="margin-left:10px;">Logout</a>
-      </div>
-      <p>No servers yet.</p>
-    `);
-  }
-
-  const snapsR = await pool.query<{ snapshot_at: string; uploads_count: string; total_bytes: string }>(
-    `
-    SELECT
-      u.snapshot_at,
-      COUNT(*)::text AS uploads_count,
-      COALESCE(SUM(d.size_bytes), 0)::text AS total_bytes
-    FROM uploads u
-    LEFT JOIN db_sizes d
-      ON d.upload_id = u.id
-    WHERE u.server_name = $1 AND u.snapshot_at IS NOT NULL
-    GROUP BY u.snapshot_at
-    ORDER BY u.snapshot_at DESC
-    LIMIT 60
-    `,
-    [server]
-  );
-
-  const serverOptions = servers
-    .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s)}</option>`)
-    .join("");
-
-  const rowsHtml = snapsR.rows
-    .map((r) => {
-      const snapIso = new Date(r.snapshot_at).toISOString();
-      const total = formatBytes(Number(r.total_bytes));
-      return `
-        <tr>
-          <td>${escapeHtml(snapIso)}</td>
-          <td align="right">${escapeHtml(r.uploads_count)}</td>
-          <td align="right">${escapeHtml(total)}</td>
-          <td>
-            <form method="post" action="/snapshots/delete" onsubmit="return confirm('Delete snapshot ${escapeHtml(snapIso)} for server ${escapeHtml(server)}?');">
-              <input type="hidden" name="server_name" value="${escapeHtml(server)}" />
-              <input type="hidden" name="snapshot_at" value="${escapeHtml(snapIso)}" />
-              <button type="submit">Delete</button>
-            </form>
-          </td>
-        </tr>
-      `;
-    })
-    .join("");
-
-  res.type("html").send(`
-    <div style="margin-bottom:12px;">
-      <a href="/" style="display:inline-block; padding:6px 10px; border:1px solid #ccc; text-decoration:none;">← Back</a>
-      <a href="/logout" style="margin-left:10px;">Logout</a>
-    </div>
-
-    <h2>Snapshots</h2>
-
-    <form method="get" action="/snapshots" style="margin-bottom:12px;">
-      <label>Server: </label>
-      <select name="server">${serverOptions}</select>
-      <button type="submit" style="margin-left:10px;">Load</button>
-    </form>
-
-    <p style="color:#555">
-      This page deletes snapshots by (server_name + snapshot_at). It deletes all uploads matching that snapshot and cascades to db_sizes.
-    </p>
-
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; min-width:900px;">
-      <thead>
-        <tr style="background:#f2f2f2;">
-          <th align="left">Snapshot (UTC)</th>
-          <th align="right">Uploads</th>
-          <th align="right">Total size</th>
-          <th align="left">Action</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rowsHtml || '<tr><td colspan="4" style="color:#555">No snapshots found</td></tr>'}
-      </tbody>
-    </table>
-  `);
+app.get("/logout", (req, res) => {
+  res.clearCookie("auth");
+  res.redirect("/login");
 });
 
-app.post("/snapshots/delete", async (req, res) => {
-  const server = String((req.body as any)?.server_name || "").trim();
-  const snapshot_at_raw = String((req.body as any)?.snapshot_at || "").trim();
-  const snapshot_date = snapshot_at_raw ? new Date(snapshot_at_raw) : null;
-  if (!snapshot_date || Number.isNaN(snapshot_date.getTime())) {
-    return res.status(400).type("html").send(`
-      <p>Invalid snapshot_at</p>
-      <p><a href="/snapshots">Back</a></p>
-    `);
-  }
-  const snapshot_at = snapshot_date.toISOString();
+// -------------------- Helpers --------------------
+function escapeHtml(s: any): string {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
-  if (!server || !snapshot_at) {
-    return res.status(400).type("html").send(`
-      <p>Missing server_name or snapshot_at</p>
-      <p><a href="/snapshots">Back</a></p>
-    `);
+function fmtBytesPretty(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let b = bytes;
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) {
+    b /= 1024;
+    i++;
   }
+  const n = i === 0 ? Math.round(b) : Math.round(b * 10) / 10;
+  return `${n} ${units[i]}`;
+}
+
+function toUtcMidnightIsoFromDateOnly(dateOnly: string): string | null {
+  // dateOnly: YYYY-MM-DD
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOnly)) return null;
+  // Force UTC midnight
+  return new Date(dateOnly + "T00:00:00Z").toISOString();
+}
+
+function normalizeTextInput(text: string): string {
+  // Normalize common copy/paste issues (NBSP, weird unicode spaces)
+  return String(text ?? "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+}
+
+// -------------------- Parsing --------------------
+type ParsedDbSizeRow = { datname: string; size_pretty: string; size_bytes: number };
+
+function parsePrettySizeToBytes(s: string): number | null {
+  const str = String(s ?? "").trim();
+  if (!str) return null;
+
+  // Examples: "39 GB", "4512 MB", "7779 kB"
+  const m = str.match(/^(-?\d+(?:[.,]\d+)?)\s*([A-Za-z]+)$/);
+  if (!m) return null;
+
+  const num = parseFloat(m[1].replace(",", "."));
+  if (!Number.isFinite(num)) return null;
+
+  const unit = m[2].toLowerCase();
+
+  const mul = (p: number) => Math.round(num * Math.pow(1024, p));
+
+  if (unit === "b" || unit === "byte" || unit === "bytes") return Math.round(num);
+  if (unit === "kb" || unit === "kib") return mul(1);
+  if (unit === "mb" || unit === "mib") return mul(2);
+  if (unit === "gb" || unit === "gib") return mul(3);
+  if (unit === "tb" || unit === "tib") return mul(4);
+  if (unit === "pb" || unit === "pib") return mul(5);
+
+  // tolerate Postgres kB -> "kb" already after toLowerCase()
+  if (unit === "k") return mul(1);
+  if (unit === "m") return mul(2);
+  if (unit === "g") return mul(3);
+  if (unit === "t") return mul(4);
+  if (unit === "p") return mul(5);
+
+  return null;
+}
+
+function parsePgSizeOutput(input: string): ParsedDbSizeRow[] {
+  const text = normalizeTextInput(input);
+  const lines = text.split("\n");
+
+  const rows: ParsedDbSizeRow[] = [];
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    // ignore headers/separators/footers from psql pretty output
+    if (/^\(\d+\s+rows\)/i.test(line)) continue;
+    if (/^-+\+-+/.test(line)) continue;
+    if (/^datname\s*\|\s*pg_size_pretty/i.test(line)) continue;
+
+    if (!line.includes("|")) continue;
+
+    const parts = line.split("|");
+    if (parts.length < 2) continue;
+
+    const datname = parts[0].trim();
+    const size_pretty = parts[1].trim();
+    if (!datname || !size_pretty) continue;
+
+    const size_bytes = parsePrettySizeToBytes(size_pretty);
+    if (size_bytes == null) continue;
+
+    rows.push({ datname, size_pretty, size_bytes });
+  }
+
+  if (rows.length === 0) {
+    throw new Error("No db size rows parsed (input format not recognized).");
+  }
+  return rows;
+}
+
+// -------------------- DB writes --------------------
+async function insertSnapshotWithSizes(args: {
+  snapshot_at: string; // ISO
+  server_name?: string | null;
+  rows: ParsedDbSizeRow[];
+}): Promise<{ snapshot_id: number; inserted_rows: number }> {
+  const snapshot_at = new Date(args.snapshot_at);
+  if (Number.isNaN(snapshot_at.getTime())) throw new Error("Invalid snapshot_at");
+
+  const server_name = (args.server_name ?? "").trim() || null;
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const del = await client.query<{ c: string }>(
-      `WITH deleted AS (
-         DELETE FROM uploads
-         WHERE server_name = $1 AND snapshot_at = $2
-         RETURNING id
-       )
-       SELECT COUNT(*)::text AS c FROM deleted`,
-      [server, snapshot_at]
+    const snapRes = await client.query(
+      `INSERT INTO snapshots(snapshot_at, server_name) VALUES ($1, $2) RETURNING id`,
+      [snapshot_at.toISOString(), server_name]
+    );
+    const snapshot_id = Number(snapRes.rows[0].id);
+
+    // Bulk insert
+    // Use VALUES list
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let i = 1;
+    for (const r of args.rows) {
+      values.push(snapshot_id, r.datname, r.size_pretty, r.size_bytes);
+      placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++})`);
+    }
+
+    await client.query(
+      `INSERT INTO db_sizes(snapshot_id, datname, size_pretty, size_bytes) VALUES ${placeholders.join(",")}`,
+      values
     );
 
     await client.query("COMMIT");
-
-    const count = del.rows[0]?.c ?? "0";
-    res.type("html").send(`
-      <p>Deleted uploads: <b>${escapeHtml(count)}</b></p>
-      <p><a href="/snapshots?server=${encodeURIComponent(server)}">Back to snapshots</a></p>
-      <p><a href="/">Home</a></p>
-    `);
-  } catch (e: any) {
+    return { snapshot_id, inserted_rows: args.rows.length };
+  } catch (e) {
     await client.query("ROLLBACK");
-    console.error(e);
-    res.status(500).type("html").send(`<p>Delete failed: ${escapeHtml(e?.message || "error")}</p><p><a href="/snapshots">Back</a></p>`);
+    throw e;
   } finally {
     client.release();
   }
+}
+
+// -------------------- Ingest endpoints --------------------
+
+// UI paste-text (urlencoded) — NO multer/busboy here
+app.post("/ingest-text", requireAuth, async (req, res) => {
+  try {
+    const text = String((req.body as any)?.text || "");
+    const server_name = String((req.body as any)?.server_name || "").trim();
+    const snapshot_date = String((req.body as any)?.snapshot_date || "").trim(); // YYYY-MM-DD optional
+
+    if (!text.trim()) {
+      return res.status(400).type("html").send(`<p>Empty text</p><p><a href="/">Back</a></p>`);
+    }
+
+    const rows = parsePgSizeOutput(text);
+
+    const snapshot_at =
+      (snapshot_date ? toUtcMidnightIsoFromDateOnly(snapshot_date) : null) || new Date().toISOString();
+
+    await insertSnapshotWithSizes({ snapshot_at, server_name, rows });
+
+    res.redirect("/?msg=" + encodeURIComponent("Uploaded"));
+  } catch (e: any) {
+    console.error("ingest-text failed:", e?.stack || e);
+    res.status(500).type("html").send(`
+      <h3>Upload failed</h3>
+      <pre>${escapeHtml(String(e?.message || e))}</pre>
+      <p><a href="/">Back</a></p>
+    `);
+  }
 });
 
-// -------------------- Listen --------------------
+// UI file upload (multipart) — uses multer
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-const PORT = Number(process.env.PORT || 3000);
+app.post("/upload", requireAuth, upload.single("file"), async (req, res) => {
+  try {
+    const server_name = String((req.body as any)?.server_name || "").trim();
+    const snapshot_date = String((req.body as any)?.snapshot_date || "").trim();
+
+    const buf = (req.file as any)?.buffer as Buffer | undefined;
+    const text = buf ? buf.toString("utf-8") : "";
+
+    if (!text.trim()) {
+      return res.status(400).type("html").send(`<p>Empty file</p><p><a href="/">Back</a></p>`);
+    }
+
+    const rows = parsePgSizeOutput(text);
+    const snapshot_at =
+      (snapshot_date ? toUtcMidnightIsoFromDateOnly(snapshot_date) : null) || new Date().toISOString();
+
+    await insertSnapshotWithSizes({ snapshot_at, server_name, rows });
+
+    res.redirect("/?msg=" + encodeURIComponent("Uploaded"));
+  } catch (e: any) {
+    console.error("upload failed:", e?.stack || e);
+    res.status(500).type("html").send(`
+      <h3>Upload failed</h3>
+      <pre>${escapeHtml(String(e?.message || e))}</pre>
+      <p><a href="/">Back</a></p>
+    `);
+  }
+});
+
+// API ingest (text/plain body) for automation
+app.post("/api/ingest", async (req, res) => {
+  try {
+    if (INGEST_API_KEY) {
+      const key = String(req.header("X-API-Key") || "");
+      if (key !== INGEST_API_KEY) return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+
+    const server_name = String(req.query?.server_name || "").trim();
+    const snapshot_at_q = String(req.query?.snapshot_at || "").trim();
+
+    const bodyText = normalizeTextInput(String(req.body || ""));
+    if (!bodyText.trim()) return res.status(400).json({ ok: false, error: "Empty body" });
+
+    const rows = parsePgSizeOutput(bodyText);
+
+    const snapshot_at = snapshot_at_q ? new Date(snapshot_at_q).toISOString() : new Date().toISOString();
+    await insertSnapshotWithSizes({ snapshot_at, server_name, rows });
+
+    res.json({ ok: true, rows: rows.length, server_name: server_name || null, snapshot_at });
+  } catch (e: any) {
+    console.error("api/ingest failed:", e?.stack || e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// -------------------- Pages --------------------
+app.get("/", requireAuth, async (req, res) => {
+  const msg = typeof req.query?.msg === "string" ? req.query.msg : "";
+  const server = typeof req.query?.server === "string" ? req.query.server : "";
+
+  // Determine latest snapshot per server filter
+  const latestSnapRes = await pool.query(
+    `SELECT id, snapshot_at, server_name
+     FROM snapshots
+     WHERE ($1 = '' OR server_name = $1)
+     ORDER BY snapshot_at DESC
+     LIMIT 1`,
+    [server]
+  );
+
+  const latest = latestSnapRes.rows[0] || null;
+
+  let rows: any[] = [];
+  let totalBytes = 0;
+
+  if (latest) {
+    const sizesRes = await pool.query(
+      `SELECT datname, size_pretty, size_bytes
+       FROM db_sizes
+       WHERE snapshot_id = $1
+       ORDER BY size_bytes DESC`,
+      [latest.id]
+    );
+    rows = sizesRes.rows;
+    totalBytes = rows.reduce((a, r) => a + Number(r.size_bytes || 0), 0);
+  }
+
+  const serversRes = await pool.query(
+    `SELECT DISTINCT COALESCE(server_name, '') AS server_name
+     FROM snapshots
+     ORDER BY server_name`
+  );
+  const servers = serversRes.rows.map((r) => String(r.server_name || ""));
+
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>DBHistory</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:18px}
+    a{color:#0366d6;text-decoration:none}
+    a:hover{text-decoration:underline}
+    .topbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:12px 0}
+    textarea{width:100%;box-sizing:border-box}
+    input,select,button{padding:8px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    th{position:sticky;top:0;background:#fafafa}
+    .muted{color:#666}
+    .right{text-align:right}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px}
+    @media (min-width: 960px){ .grid{grid-template-columns:1fr 1fr} }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <strong>DBHistory</strong>
+    <a href="/">Home</a>
+    <a href="/charts">Charts</a>
+    <a href="/diff">Diff</a>
+    <a href="/snapshots">Snapshots</a>
+    <span class="muted">|</span>
+    <a href="/logout">Logout</a>
+  </div>
+
+  ${msg ? `<div class="card"><b>${escapeHtml(msg)}</b></div>` : ""}
+
+  <div class="card">
+    <form method="get" action="/" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+      <div>
+        <div class="muted">Server</div>
+        <select name="server">
+          <option value="" ${server === "" ? "selected" : ""}>(all)</option>
+          ${servers
+            .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s || "(empty)")}</option>`)
+            .join("")}
+        </select>
+      </div>
+      <button type="submit">Apply</button>
+    </form>
+    <div style="margin-top:10px" class="muted">
+      Latest snapshot: ${
+        latest
+          ? `${escapeHtml(new Date(latest.snapshot_at).toISOString())} | server: ${escapeHtml(latest.server_name || "")} | total: <b>${escapeHtml(fmtBytesPretty(totalBytes))}</b>`
+          : "No data yet"
+      }
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Paste text</h3>
+      <form method="post" action="/ingest-text">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <div>
+            <div class="muted">Server (optional)</div>
+            <input name="server_name" placeholder="AWS / prod-msk / ..." />
+          </div>
+          <div>
+            <div class="muted">Snapshot date (optional)</div>
+            <input type="date" name="snapshot_date" />
+          </div>
+        </div>
+        <div style="margin-top:8px" class="muted">Format: <code>dbname | 39 GB</code> (one per line)</div>
+        <textarea name="text" rows="14" placeholder="TMSKZ_live | 39 GB"></textarea>
+        <div style="margin-top:8px">
+          <button type="submit">Upload</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Upload file</h3>
+      <form method="post" action="/upload" enctype="multipart/form-data">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <div>
+            <div class="muted">Server (optional)</div>
+            <input name="server_name" placeholder="AWS / prod-msk / ..." />
+          </div>
+          <div>
+            <div class="muted">Snapshot date (optional)</div>
+            <input type="date" name="snapshot_date" />
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <input type="file" name="file" />
+        </div>
+        <div style="margin-top:8px">
+          <button type="submit">Upload file</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Latest DB sizes</h3>
+    ${
+      latest
+        ? `
+      <table>
+        <thead><tr><th>Database</th><th class="right">Size</th></tr></thead>
+        <tbody>
+          ${rows
+            .map(
+              (r) => `<tr><td>${escapeHtml(r.datname)}</td><td class="right">${escapeHtml(r.size_pretty)}</td></tr>`
+            )
+            .join("")}
+        </tbody>
+        <tfoot>
+          <tr><td><b>Total</b></td><td class="right"><b>${escapeHtml(fmtBytesPretty(totalBytes))}</b></td></tr>
+        </tfoot>
+      </table>
+      `
+        : `<div class="muted">No data yet.</div>`
+    }
+  </div>
+</body>
+</html>
+`);
+});
+
+app.get("/charts", requireAuth, async (req, res) => {
+  const server = typeof req.query?.server === "string" ? req.query.server : "";
+
+  const serversRes = await pool.query(
+    `SELECT DISTINCT COALESCE(server_name, '') AS server_name
+     FROM snapshots
+     ORDER BY server_name`
+  );
+  const servers = serversRes.rows.map((r) => String(r.server_name || ""));
+
+  // Time series per DB for selected server
+  const seriesRes = await pool.query(
+    `SELECT s.snapshot_at, COALESCE(s.server_name,'') AS server_name, d.datname, d.size_bytes
+     FROM snapshots s
+     JOIN db_sizes d ON d.snapshot_id = s.id
+     WHERE ($1 = '' OR s.server_name = $1)
+     ORDER BY s.snapshot_at ASC`,
+    [server]
+  );
+
+  // Bar chart for selected snapshot (latest by default)
+  const latestSnapRes = await pool.query(
+    `SELECT id, snapshot_at
+     FROM snapshots
+     WHERE ($1 = '' OR server_name = $1)
+     ORDER BY snapshot_at DESC
+     LIMIT 1`,
+    [server]
+  );
+  const latest = latestSnapRes.rows[0] || null;
+
+  const barRes = latest
+    ? await pool.query(
+        `SELECT datname, size_bytes
+         FROM db_sizes
+         WHERE snapshot_id = $1
+         ORDER BY size_bytes DESC`,
+        [latest.id]
+      )
+    : { rows: [] as any[] };
+
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Charts</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:18px}
+    a{color:#0366d6;text-decoration:none}
+    .topbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:12px 0}
+    canvas{max-width:100%}
+    select,button{padding:8px}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="topbar">
+    <strong>DBHistory</strong>
+    <a href="/">Home</a>
+    <a href="/charts">Charts</a>
+    <a href="/diff">Diff</a>
+    <a href="/snapshots">Snapshots</a>
+    <span style="color:#666">|</span>
+    <a href="/logout">Logout</a>
+  </div>
+
+  <div class="card">
+    <form method="get" action="/charts" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+      <div>
+        <div style="color:#666">Server</div>
+        <select name="server">
+          <option value="" ${server === "" ? "selected" : ""}>(all)</option>
+          ${servers
+            .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s || "(empty)")}</option>`)
+            .join("")}
+        </select>
+      </div>
+      <button type="submit">Apply</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Lines (all databases)</h3>
+    <canvas id="lineChart" height="120"></canvas>
+  </div>
+
+  <div class="card">
+    <h3>Bars (latest snapshot)</h3>
+    <div style="color:#666">Snapshot: ${latest ? escapeHtml(new Date(latest.snapshot_at).toISOString()) : "—"}</div>
+    <canvas id="barChart" height="120"></canvas>
+  </div>
+
+<script>
+  const raw = ${JSON.stringify(seriesRes.rows)};
+  const bar = ${JSON.stringify(barRes.rows)};
+
+  // Build line datasets: one dataset per datname
+  const byDb = new Map();
+  for (const r of raw) {
+    const t = new Date(r.snapshot_at).toISOString().slice(0,10);
+    const key = r.datname;
+    if (!byDb.has(key)) byDb.set(key, []);
+    byDb.get(key).push({ x: t, y: Number(r.size_bytes) });
+  }
+
+  const lineDatasets = Array.from(byDb.entries()).map(([name, pts]) => ({
+    label: name,
+    data: pts,
+    tension: 0.15
+  }));
+
+  new Chart(document.getElementById('lineChart'), {
+    type: 'line',
+    data: { datasets: lineDatasets },
+    options: {
+      parsing: false,
+      interaction: { mode: 'nearest', intersect: false },
+      scales: {
+        x: { type: 'category' },
+        y: { ticks: { callback: v => v } }
+      }
+    }
+  });
+
+  new Chart(document.getElementById('barChart'), {
+    type: 'bar',
+    data: {
+      labels: bar.map(x => x.datname),
+      datasets: [{ label: 'Size (bytes)', data: bar.map(x => Number(x.size_bytes)) }]
+    },
+    options: {
+      scales: { x: { ticks: { autoSkip: false, maxRotation: 90, minRotation: 45 } } }
+    }
+  });
+</script>
+
+</body>
+</html>
+`);
+});
+
+app.get("/diff", requireAuth, async (req, res) => {
+  const server = typeof req.query?.server === "string" ? req.query.server : "";
+
+  const serversRes = await pool.query(
+    `SELECT DISTINCT COALESCE(server_name, '') AS server_name
+     FROM snapshots
+     ORDER BY server_name`
+  );
+  const servers = serversRes.rows.map((r) => String(r.server_name || ""));
+
+  const snapsRes = await pool.query(
+    `SELECT id, snapshot_at
+     FROM snapshots
+     WHERE ($1 = '' OR server_name = $1)
+     ORDER BY snapshot_at DESC
+     LIMIT 10`,
+    [server]
+  );
+  const snaps = snapsRes.rows;
+
+  if (snaps.length === 0) {
+    return res.type("html").send(`
+<!doctype html><html><head><meta charset="utf-8"/><title>Diff</title></head>
+<body style="font-family:system-ui,Segoe UI,Arial;margin:18px">
+  <p><a href="/">Back</a></p>
+  <p>No snapshots yet.</p>
+</body></html>`);
+  }
+
+  const snapIds = snaps.map((s) => s.id);
+  const sizesRes = await pool.query(
+    `SELECT snapshot_id, datname, size_bytes
+     FROM db_sizes
+     WHERE snapshot_id = ANY($1::bigint[])`,
+    [snapIds]
+  );
+
+  // Map: datname -> Map<snapshot_id, size_bytes>
+  const byDb = new Map<string, Map<number, number>>();
+  for (const r of sizesRes.rows) {
+    const db = String(r.datname);
+    const sid = Number(r.snapshot_id);
+    const b = Number(r.size_bytes);
+    if (!byDb.has(db)) byDb.set(db, new Map());
+    byDb.get(db)!.set(sid, b);
+  }
+
+  // Totals per snapshot
+  const totalsBySnap = new Map<number, number>();
+  for (const sid of snapIds) totalsBySnap.set(sid, 0);
+  for (const r of sizesRes.rows) {
+    const sid = Number(r.snapshot_id);
+    totalsBySnap.set(sid, (totalsBySnap.get(sid) || 0) + Number(r.size_bytes || 0));
+  }
+
+  // Sort DBs by last snapshot size desc
+  const lastSnapId = Number(snaps[0].id);
+  const dbsSorted = Array.from(byDb.keys()).sort((a, b) => {
+    const aa = byDb.get(a)!.get(lastSnapId) || 0;
+    const bb = byDb.get(b)!.get(lastSnapId) || 0;
+    return bb - aa;
+  });
+
+  const snapHeaders = snaps.map((s) => new Date(s.snapshot_at).toISOString().slice(0, 10));
+  const snapIdByIdx = snaps.map((s) => Number(s.id));
+
+  function pctChange(last: number, prev: number): string {
+    if (!Number.isFinite(last) || !Number.isFinite(prev)) return "";
+    if (prev === 0) return "";
+    const p = ((last - prev) / prev) * 100;
+    const n = Math.round(p * 10) / 10;
+    return `${n}%`;
+  }
+
+  function estMonthly(last: number, prev: number, days: number): string {
+    if (!Number.isFinite(last) || !Number.isFinite(prev)) return "";
+    if (days <= 0) return "";
+    const perDay = (last - prev) / days;
+    const perMonth = perDay * 30;
+    return fmtBytesPretty(Math.max(0, Math.round(perMonth)));
+  }
+
+  const lastAt = new Date(snaps[0].snapshot_at).getTime();
+  const prevAt = snaps.length > 1 ? new Date(snaps[1].snapshot_at).getTime() : NaN;
+  const daysBetween = Number.isFinite(prevAt) ? Math.max(1, Math.round((lastAt - prevAt) / (1000 * 60 * 60 * 24))) : 0;
+
+  const totalLast = totalsBySnap.get(snapIdByIdx[0]) || 0;
+  const totalPrev = snapIdByIdx.length > 1 ? (totalsBySnap.get(snapIdByIdx[1]) || 0) : 0;
+
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Diff</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:18px}
+    a{color:#0366d6;text-decoration:none}
+    .topbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:12px 0}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:right}
+    th:first-child, td:first-child{text-align:left}
+    th{position:sticky;top:0;background:#fafafa}
+    select,button{padding:8px}
+    .muted{color:#666}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <strong>DBHistory</strong>
+    <a href="/">Home</a>
+    <a href="/charts">Charts</a>
+    <a href="/diff">Diff</a>
+    <a href="/snapshots">Snapshots</a>
+    <span class="muted">|</span>
+    <a href="/logout">Logout</a>
+  </div>
+
+  <div class="card">
+    <form method="get" action="/diff" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+      <div>
+        <div class="muted">Server</div>
+        <select name="server">
+          <option value="" ${server === "" ? "selected" : ""}>(all)</option>
+          ${servers
+            .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s || "(empty)")}</option>`)
+            .join("")}
+        </select>
+      </div>
+      <button type="submit">Apply</button>
+    </form>
+    <div class="muted" style="margin-top:8px">Showing last 10 snapshots. Extra columns: % change (last vs prev), estimated monthly growth.</div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Database</th>
+          ${snapHeaders.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}
+          <th>%</th>
+          <th>~Monthly</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${dbsSorted
+          .map((db) => {
+            const m = byDb.get(db)!;
+            const vals = snapIdByIdx.map((sid) => m.get(sid) || 0);
+            const last = vals[0] || 0;
+            const prev = vals[1] || 0;
+            return `
+              <tr>
+                <td>${escapeHtml(db)}</td>
+                ${vals.map((v) => `<td>${escapeHtml(fmtBytesPretty(v))}</td>`).join("")}
+                <td>${escapeHtml(pctChange(last, prev))}</td>
+                <td>${escapeHtml(estMonthly(last, prev, daysBetween))}</td>
+              </tr>
+            `;
+          })
+          .join("")}
+        <tr>
+          <td><b>Total</b></td>
+          ${snapIdByIdx.map((sid) => `<td><b>${escapeHtml(fmtBytesPretty(totalsBySnap.get(sid) || 0))}</b></td>`).join("")}
+          <td><b>${escapeHtml(pctChange(totalLast, totalPrev))}</b></td>
+          <td><b>${escapeHtml(estMonthly(totalLast, totalPrev, daysBetween))}</b></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+`);
+});
+
+app.get("/snapshots", requireAuth, async (req, res) => {
+  const snapsRes = await pool.query(
+    `SELECT id, snapshot_at, COALESCE(server_name,'') AS server_name
+     FROM snapshots
+     ORDER BY snapshot_at DESC
+     LIMIT 200`
+  );
+
+  res.type("html").send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Snapshots</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:18px}
+    a{color:#0366d6;text-decoration:none}
+    .topbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+    .card{border:1px solid #ddd;border-radius:10px;padding:12px;margin:12px 0}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid #eee;padding:8px;text-align:left}
+    th{background:#fafafa}
+    button{padding:6px 10px}
+    .muted{color:#666}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <strong>DBHistory</strong>
+    <a href="/">Home</a>
+    <a href="/charts">Charts</a>
+    <a href="/diff">Diff</a>
+    <a href="/snapshots">Snapshots</a>
+    <span class="muted">|</span>
+    <a href="/logout">Logout</a>
+  </div>
+
+  <div class="card">
+    <h3>Snapshots</h3>
+    <table>
+      <thead><tr><th>Snapshot</th><th>Server</th><th>Action</th></tr></thead>
+      <tbody>
+        ${snapsRes.rows
+          .map((r) => {
+            const snapIso = new Date(r.snapshot_at).toISOString();
+            return `
+              <tr>
+                <td>${escapeHtml(snapIso)}</td>
+                <td>${escapeHtml(r.server_name || "")}</td>
+                <td>
+                  <form method="post" action="/snapshots/delete" onsubmit="return confirm('Delete this snapshot?')">
+                    <input type="hidden" name="snapshot_id" value="${escapeHtml(r.id)}" />
+                    <input type="hidden" name="snapshot_at" value="${escapeHtml(snapIso)}" />
+                    <button type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            `;
+          })
+          .join("")}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+`);
+});
+
+app.post("/snapshots/delete", requireAuth, async (req, res) => {
+  try {
+    const snapshot_id = Number(String((req.body as any)?.snapshot_id || "").trim());
+    const snapshot_at_raw = String((req.body as any)?.snapshot_at || "").trim();
+
+    const snapshot_date = snapshot_at_raw ? new Date(snapshot_at_raw) : null;
+    if (!snapshot_date || Number.isNaN(snapshot_date.getTime())) {
+      return res.status(400).type("html").send(`
+        <p>Invalid snapshot_at</p>
+        <p><a href="/snapshots">Back</a></p>
+      `);
+    }
+    const snapshot_at = snapshot_date.toISOString();
+
+    if (!Number.isFinite(snapshot_id) || snapshot_id <= 0) {
+      return res.status(400).type("html").send(`<p>Invalid snapshot_id</p><p><a href="/snapshots">Back</a></p>`);
+    }
+
+    // delete by id (safer)
+    await pool.query(`DELETE FROM snapshots WHERE id = $1`, [snapshot_id]);
+
+    res.redirect("/snapshots?msg=" + encodeURIComponent(`Deleted ${snapshot_at}`));
+  } catch (e: any) {
+    console.error("delete snapshot failed:", e?.stack || e);
+    res.status(500).type("html").send(`
+      <h3>Delete failed</h3>
+      <pre>${escapeHtml(String(e?.message || e))}</pre>
+      <p><a href="/snapshots">Back</a></p>
+    `);
+  }
+});
+
+// -------------------- Start --------------------
 app.listen(PORT, () => {
-  console.log("Listening on " + PORT);
+  console.log(`DBHistory listening on ${PORT}`);
 });

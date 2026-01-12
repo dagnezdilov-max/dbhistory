@@ -448,8 +448,12 @@ app.get("/", requireAuth, async (req, res) => {
     th{position:sticky;top:0;background:#fafafa}
     .muted{color:#666}
     .right{text-align:right}
-    .grid{display:grid;grid-template-columns:1fr;gap:12px}
-    @media (min-width: 960px){ .grid{grid-template-columns:1fr 1fr} }
+    /* Two-column layout */
+    .page{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+    .left{flex:1 1 640px;min-width:420px}
+    .right{flex:0 0 420px;min-width:360px}
+    .section-title{margin:0 0 8px 0}
+    .form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
   </style>
 </head>
 <body>
@@ -465,100 +469,112 @@ app.get("/", requireAuth, async (req, res) => {
 
   ${msg ? `<div class="card"><b>${escapeHtml(msg)}</b></div>` : ""}
 
-  <div class="card">
-    <form method="get" action="/" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
-      <div>
-        <div class="muted">Server</div>
-        <select name="server">
-          <option value="" ${server === "" ? "selected" : ""}>(all)</option>
-          ${servers
-            .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s || "(empty)")}</option>`)
-            .join("")}
-        </select>
+  <div class="page">
+    <div class="left">
+
+      <div class="card">
+        <h3 class="section-title">Latest snapshot</h3>
+        <form method="get" action="/" class="form-row">
+          <div>
+            <div class="muted">Server</div>
+            <select name="server">
+              <option value="" ${server === "" ? "selected" : ""}>(all)</option>
+              ${servers
+                .map((s) => `<option value="${escapeHtml(s)}" ${s === server ? "selected" : ""}>${escapeHtml(s || "(empty)")}</option>`)
+                .join("")}
+            </select>
+          </div>
+          <button type="submit">Apply</button>
+        </form>
+
+        <div style="margin-top:10px" class="muted">
+          ${
+            latest
+              ? `${escapeHtml(new Date(latest.snapshot_at).toISOString())} | server: ${escapeHtml(latest.server_name || "")} | total: <b>${escapeHtml(fmtBytesPretty(totalBytes))}</b>`
+              : "No data yet"
+          }
+        </div>
+
+        <div style="margin-top:10px">
+          ${
+            latest
+              ? `
+            <table>
+              <thead><tr><th>Database</th><th class="right">Size</th></tr></thead>
+              <tbody>
+                ${rows
+                  .map(
+                    (r) => `<tr><td>${escapeHtml(r.datname)}</td><td class="right">${escapeHtml(r.size_pretty)}</td></tr>`
+                  )
+                  .join("")}
+              </tbody>
+              <tfoot>
+                <tr><td><b>Total</b></td><td class="right"><b>${escapeHtml(fmtBytesPretty(totalBytes))}</b></td></tr>
+              </tfoot>
+            </table>
+            `
+              : `<div class="muted">No data yet.</div>`
+          }
+        </div>
       </div>
-      <button type="submit">Apply</button>
-    </form>
-    <div style="margin-top:10px" class="muted">
-      Latest snapshot: ${
-        latest
-          ? `${escapeHtml(new Date(latest.snapshot_at).toISOString())} | server: ${escapeHtml(latest.server_name || "")} | total: <b>${escapeHtml(fmtBytesPretty(totalBytes))}</b>`
-          : "No data yet"
-      }
+
+     
+    </div>
+    <div class="right">
+
+       <div class="card">
+        <h3 class="section-title">Paste text</h3>
+        <form method="post" action="/ingest-text">
+          <div class="form-row">
+            <div>
+              <div class="muted">Server (optional)</div>
+              <input name="server_name" placeholder="AWS / prod-msk / ..." />
+            </div>
+            <div>
+              <div class="muted">Snapshot date (optional)</div>
+              <input type="date" name="snapshot_date" />
+            </div>
+            <div>
+              <div class="muted">&nbsp;</div>
+              <button type="submit">Upload</button>
+            </div>
+          </div>
+          <div style="margin-top:8px" class="muted">Format: <code>dbname | 39 GB</code> (one per line)</div>
+          <textarea name="text" rows="10" placeholder="TMSKZ_live | 39 GB"></textarea>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3 class="section-title">Upload file</h3>
+        <form method="post" action="/upload" enctype="multipart/form-data">
+          <div class="form-row">
+            <div>
+              <div class="muted">Server (optional)</div>
+              <input name="server_name" placeholder="AWS / prod-msk / ..." />
+            </div>
+            <div>
+              <div class="muted">Snapshot date (optional)</div>
+              <input type="date" name="snapshot_date" />
+            </div>
+            <div>
+              <div class="muted">File</div>
+              <input type="file" name="file" />
+            </div>
+            <div>
+              <div class="muted">&nbsp;</div>
+              <button type="submit">Upload file</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
     </div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <h3>Paste text</h3>
-      <form method="post" action="/ingest-text">
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <div>
-            <div class="muted">Server (optional)</div>
-            <input name="server_name" placeholder="AWS / prod-msk / ..." />
-          </div>
-          <div>
-            <div class="muted">Snapshot date (optional)</div>
-            <input type="date" name="snapshot_date" />
-          </div>
-        </div>
-        <div style="margin-top:8px" class="muted">Format: <code>dbname | 39 GB</code> (one per line)</div>
-        <textarea name="text" rows="14" placeholder="TMSKZ_live | 39 GB"></textarea>
-        <div style="margin-top:8px">
-          <button type="submit">Upload</button>
-        </div>
-      </form>
-    </div>
-
-    <div class="card">
-      <h3>Upload file</h3>
-      <form method="post" action="/upload" enctype="multipart/form-data">
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <div>
-            <div class="muted">Server (optional)</div>
-            <input name="server_name" placeholder="AWS / prod-msk / ..." />
-          </div>
-          <div>
-            <div class="muted">Snapshot date (optional)</div>
-            <input type="date" name="snapshot_date" />
-          </div>
-        </div>
-        <div style="margin-top:8px">
-          <input type="file" name="file" />
-        </div>
-        <div style="margin-top:8px">
-          <button type="submit">Upload file</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>Latest DB sizes</h3>
-    ${
-      latest
-        ? `
-      <table>
-        <thead><tr><th>Database</th><th class="right">Size</th></tr></thead>
-        <tbody>
-          ${rows
-            .map(
-              (r) => `<tr><td>${escapeHtml(r.datname)}</td><td class="right">${escapeHtml(r.size_pretty)}</td></tr>`
-            )
-            .join("")}
-        </tbody>
-        <tfoot>
-          <tr><td><b>Total</b></td><td class="right"><b>${escapeHtml(fmtBytesPretty(totalBytes))}</b></td></tr>
-        </tfoot>
-      </table>
-      `
-        : `<div class="muted">No data yet.</div>`
-    }
-  </div>
 </body>
 </html>
 `);
 });
-
 app.get("/charts", requireAuth, async (req, res) => {
   const server = typeof req.query?.server === "string" ? req.query.server : "";
 
@@ -765,8 +781,9 @@ app.get("/diff", requireAuth, async (req, res) => {
     return bb - aa;
   });
 
-  const snapHeaders = snaps.map((s) => new Date(s.snapshot_at).toISOString().slice(0, 10));
-  const snapIdByIdx = snaps.map((s) => Number(s.id));
+  const snapsAsc = [...snaps].slice().reverse();
+  const snapHeaders = snapsAsc.map((s) => new Date(s.snapshot_at).toISOString().slice(0, 10));
+  const snapIdByIdx = snapsAsc.map((s) => Number(s.id));
 
   function pctChange(last: number, prev: number): string {
     if (!Number.isFinite(last) || !Number.isFinite(prev)) return "";
@@ -788,8 +805,8 @@ app.get("/diff", requireAuth, async (req, res) => {
   const prevAt = snaps.length > 1 ? new Date(snaps[1].snapshot_at).getTime() : NaN;
   const daysBetween = Number.isFinite(prevAt) ? Math.max(1, Math.round((lastAt - prevAt) / (1000 * 60 * 60 * 24))) : 0;
 
-  const totalLast = totalsBySnap.get(snapIdByIdx[0]) || 0;
-  const totalPrev = snapIdByIdx.length > 1 ? (totalsBySnap.get(snapIdByIdx[1]) || 0) : 0;
+  const totalLast = totalsBySnap.get(Number(snaps[0].id)) || 0;
+  const totalPrev = snaps.length > 1 ? (totalsBySnap.get(Number(snaps[1].id)) || 0) : 0;
 
   res.type("html").send(`
 <!doctype html>
@@ -852,8 +869,10 @@ app.get("/diff", requireAuth, async (req, res) => {
           .map((db) => {
             const m = byDb.get(db)!;
             const vals = snapIdByIdx.map((sid) => m.get(sid) || 0);
-            const last = vals[0] || 0;
-            const prev = vals[1] || 0;
+            const newestId = Number(snaps[0].id);
+            const prevId = snaps.length > 1 ? Number(snaps[1].id) : NaN;
+            const last = m.get(newestId) || 0;
+            const prev = Number.isFinite(prevId) ? (m.get(prevId) || 0) : 0;
             return `
               <tr>
                 <td>${escapeHtml(db)}</td>
